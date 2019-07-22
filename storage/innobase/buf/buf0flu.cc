@@ -168,8 +168,10 @@ struct page_cleaner_t {
                             in existence */
   bool requested;           /*!< true if requested pages
                             to flush */
+  /* 应该不能超过log_sys->flushed_lsn */
   lsn_t lsn_limit;          /*!< upper limit of LSN to be
                             flushed */
+  /* slots 对应于 buffer pool 的个数，每个 bufpool 需要独自flush */
   ulint n_slots;            /*!< total number of slots */
   ulint n_slots_requested;
   /*!< number of slots
@@ -187,6 +189,7 @@ struct page_cleaner_t {
                               requests for all slots */
   ulint flush_pass;           /*!< count to finish to flush
                               requests for all slots */
+  /* 每个slot记录bufpool的信息 */
   page_cleaner_slot_t *slots; /*!< pointer to the slots */
   bool is_running;            /*!< false if attempt
                               to shutdown */
@@ -2598,6 +2601,7 @@ void buf_flush_page_cleaner_init(size_t n_page_cleaners) {
 
   page_cleaner->n_slots = static_cast<ulint>(srv_buf_pool_instances);
 
+  /* 申请n_slots个page_cleaner_slot_t */
   page_cleaner->slots = static_cast<page_cleaner_slot_t *>(
       ut_zalloc_nokey(page_cleaner->n_slots * sizeof(*page_cleaner->slots)));
 
@@ -2605,6 +2609,7 @@ void buf_flush_page_cleaner_init(size_t n_page_cleaners) {
 
   page_cleaner->is_running = true;
 
+  /* 创建4个page cleaner线程 */
   os_thread_create(page_flush_coordinator_thread_key,
                    buf_flush_page_coordinator_thread, n_page_cleaners);
 

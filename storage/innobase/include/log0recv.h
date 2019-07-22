@@ -410,10 +410,12 @@ class MetadataRecover {
 
 /** Recovery system data structure */
 struct recv_sys_t {
+  /* C++ using 用法 */
   using Pages =
       std::unordered_map<page_no_t, recv_addr_t *, std::hash<page_no_t>,
                          std::equal_to<page_no_t>>;
 
+  /* 哈希表 */
   /** Every space has its own heap and pages that belong to it. */
   struct Space {
     /** Constructor
@@ -426,12 +428,16 @@ struct recv_sys_t {
     /** Memory heap of log records and file addresses */
     mem_heap_t *m_heap;
 
+    /* 套了第二层hash，找到具体的page */
+    /* value 对应于 recv_addr_t */
     /** Pages that need to be recovered */
     Pages m_pages;
   };
 
   using Missing_Ids = std::set<space_id_t>;
 
+  /* space_id_t 是 uint 类型的 */
+  /* C++可以不用 struct 声明变量 */
   using Spaces = std::unordered_map<space_id_t, Space, std::hash<space_id_t>,
                                     std::equal_to<space_id_t>>;
 
@@ -482,15 +488,18 @@ struct recv_sys_t {
   /** Possible incomplete last recovered log block */
   byte *last_block;
 
+  /* 申请更大的空间，截断后对齐blocksize，赋值给last_block */
   /** The nonaligned start address of the preceding buffer */
   byte *last_block_buf_start;
 
+  /* 从文件读取的 redolog 放在这个buf里，等待解析 */
   /** Buffer for parsing log records */
   byte *buf;
 
   /** Size of the parsing buffer */
   size_t buf_len;
 
+  /* 感觉是与recovered_offset一起使用，循环缓冲区 */
   /** Amount of data in buf */
   ulint len;
 
@@ -499,12 +508,14 @@ struct recv_sys_t {
   start point not found yet */
   lsn_t parse_start_lsn;
 
+  /* 崩溃前存储的checkpoint，在这之前所有的data page都已经落盘了 */
   /** Checkpoint lsn that was used during recovery (read from file). */
   lsn_t checkpoint_lsn;
 
   /** Number of data bytes to ignore until we reach checkpoint_lsn. */
   ulint bytes_to_ignore_before_checkpoint;
 
+  /* 已经读取到 buf 中的 redolog 末尾对应的lsn */
   /** The log data has been scanned up to this lsn */
   lsn_t scanned_lsn;
 
@@ -512,9 +523,11 @@ struct recv_sys_t {
   number (lowest 4 bytes) */
   ulint scanned_checkpoint_no;
 
+  /* 是不是与 parse_start_lsn 是对应的？ */
   /** Start offset of non-parsed log records in buf */
   ulint recovered_offset;
 
+  /* 已经parse的redolog，解析后存到hash里 */
   /** The log records have been parsed up to this lsn */
   lsn_t recovered_lsn;
 

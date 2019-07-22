@@ -388,6 +388,7 @@ void recv_sys_create() {
   mutex_create(LATCH_ID_RECV_SYS, &recv_sys->mutex);
   mutex_create(LATCH_ID_RECV_WRITER, &recv_sys->writer_mutex);
 
+  // hash table 以 space id 作为 key
   recv_sys->spaces = nullptr;
 }
 
@@ -574,6 +575,7 @@ void recv_sys_init(ulint max_mem) {
     return;
   }
 
+  /* 修改 recv_sys 要加锁 */
   mutex_enter(&recv_sys->mutex);
 
 #ifndef UNIV_HOTBACKUP
@@ -594,12 +596,14 @@ void recv_sys_init(ulint max_mem) {
     recv_n_pool_free_frames = 512;
   }
 
+  // 从文件读取的redo log先放在这个buf里面，之后进行解析
   recv_sys->buf = static_cast<byte *>(ut_malloc_nokey(RECV_PARSING_BUF_SIZE));
   recv_sys->buf_len = RECV_PARSING_BUF_SIZE;
 
   recv_sys->len = 0;
   recv_sys->recovered_offset = 0;
 
+  /* 这是一个unordered_map */
   using Spaces = recv_sys_t::Spaces;
 
   recv_sys->spaces = UT_NEW(Spaces(), mem_log_recv_space_hash_key);
@@ -610,16 +614,22 @@ void recv_sys_init(ulint max_mem) {
   recv_sys->apply_batch_on = false;
   recv_sys->is_cloned_db = false;
 
+  /* 先申请两倍block size的连续内存 */
   recv_sys->last_block_buf_start =
       static_cast<byte *>(ut_malloc_nokey(2 * OS_FILE_LOG_BLOCK_SIZE));
 
+  /* 2 x block 连续内存中一定有对齐 block size 的位置 */
   recv_sys->last_block = static_cast<byte *>(
       ut_align(recv_sys->last_block_buf_start, OS_FILE_LOG_BLOCK_SIZE));
 
   recv_sys->found_corrupt_log = false;
   recv_sys->found_corrupt_fs = false;
 
+  /* 最大能scan到的lsn */
   recv_max_page_lsn = 0;
+
+
+  /* 想把对象空间放在recv_sys里面，否则，如果dblwr是指针，那它指向的对象不一定在哪里 */
 
   /* Call the constructor for both placement new objects. */
   new (&recv_sys->dblwr) recv_dblwr_t();
@@ -3308,6 +3318,7 @@ bool meb_scan_log_recs(
         }
       }
 
+      // log block 去头尾放入 parsedbuf
       if (!recv_sys->found_corrupt_log) {
         more_data = recv_sys_add_to_parsing_buf(log_block, scanned_lsn);
       }
@@ -3374,6 +3385,7 @@ static void recv_read_log_seg(log_t &log, byte *buf, lsn_t start_lsn,
   do {
     lsn_t source_offset;
 
+    // 当前文件中的 offset
     source_offset = log_files_real_offset_for_lsn(log, start_lsn);
 
     ut_a(end_lsn - start_lsn <= ULINT_MAX);
@@ -3422,20 +3434,29 @@ Parses and hashes the log records if new data found.
 static void recv_recovery_begin(log_t &log, lsn_t *contiguous_lsn) {
   mutex_enter(&recv_sys->mutex);
 
+  /* 缓冲区中数据长度 */
   recv_sys->len = 0;
+  /* 缓冲区中数据开始位置 */
   recv_sys->recovered_offset = 0;
+  /* hash表数目 */
   recv_sys->n_addrs = 0;
   recv_sys_empty_hash();
+
+  /* flushlist并不有序，打checkpoint时减去recent close的大小 */
+  /* 因此可能打在一条log的中间，实际checkpoint可以往后找第一个完整log */
 
   /* Since 8.0, we can start recovery at checkpoint_lsn which points
   to the middle of log record. In such case we first to need to find
   the beginning of the first group of log records, which is at lsn
   greater than the checkpoint_lsn. */
+
+  /* 可以开始parse的lsn位置 */
   recv_sys->parse_start_lsn = 0;
 
   /* This is updated when we find value for parse_start_lsn. */
   recv_sys->bytes_to_ignore_before_checkpoint = 0;
 
+  /* 传入的contiguous_lsn等于起始的checkpoint, 从这里开始 */
   recv_sys->checkpoint_lsn = *contiguous_lsn;
   recv_sys->scanned_lsn = *contiguous_lsn;
   recv_sys->recovered_lsn = *contiguous_lsn;
@@ -3461,11 +3482,14 @@ static void recv_recovery_begin(log_t &log, lsn_t *contiguous_lsn) {
 
   bool finished = false;
 
+  // 不断读取 redolog 进行解析并应用
   while (!finished) {
     lsn_t end_lsn = start_lsn + RECV_SCAN_SIZE;
 
+    // 读取 RECV_SCAN_SIZE 大小的 redolog 到 log_sys->buf 中 
     recv_read_log_seg(log, log.buf, start_lsn, end_lsn);
 
+    // 对读取到的数据进行扫描解析和应用
     finished = recv_scan_log_recs(log, max_mem, log.buf, RECV_SCAN_SIZE,
                                   checkpoint_lsn, start_lsn, contiguous_lsn,
                                   &log.scanned_lsn);
@@ -3508,6 +3532,11 @@ static void recv_init_crash_recovery() {
 dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
   /* Initialize red-black tree for fast insertions into the
   flush_list during recovery process. */
+
+  /* 正常运行阶段，对flushlist的插入是有序的 */
+  /* 恢复阶段，从hash按page进行执行，插入flushlist是无序的 */
+  /* 因此，需要rbt来保证插入后flushlist的顺序性 */
+  /* 每个bufpool一个rbt */
   buf_flush_init_flush_rbt();
 
   if (srv_force_recovery >= SRV_FORCE_NO_LOG_REDO) {
@@ -3527,6 +3556,7 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
   dberr_t err;
   ulint max_cp_field;
 
+  /* checkpoint被交叉写入两个位置，找到最后写入的值 */
   err = recv_find_max_checkpoint(log, &max_cp_field);
 
   if (err != DB_SUCCESS) {
@@ -3544,9 +3574,11 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
 
   /* Read the first log file header to print a note if this is
   a recovery from a restored InnoDB Hot Backup */
+  /* 2KB logfile hdr */
   byte log_hdr_buf[LOG_FILE_HDR_SIZE];
   const page_id_t page_id{log.files_space_id, 0};
 
+  /* 从文件第一个page里读取file header */
   err = fil_redo_io(IORequestLogRead, page_id, univ_page_size, 0,
                     LOG_FILE_HDR_SIZE, log_hdr_buf);
 
@@ -3604,6 +3636,8 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
 
   ut_ad(recv_sys->n_addrs == 0);
 
+  /* 从checkpoint开始读取redolog */
+  /* contiguous_lsn已经读取到的redolog */
   lsn_t contiguous_lsn;
 
   contiguous_lsn = checkpoint_lsn;
@@ -3656,6 +3690,7 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
 
   contiguous_lsn = checkpoint_lsn;
 
+  // 主要流程
   recv_recovery_begin(log, &contiguous_lsn);
 
   lsn_t recovered_lsn;

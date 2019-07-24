@@ -1235,6 +1235,7 @@ void recv_apply_hashed_log_recs(log_t &log, bool allow_ibuf) {
   recv_sys->apply_log_recs = true;
   recv_sys->apply_batch_on = true;
 
+  /* 要apply的不同page个数 */
   auto batch_size = recv_sys->n_addrs;
 
   ib::info(ER_IB_MSG_707, ulonglong{batch_size});
@@ -1243,8 +1244,11 @@ void recv_apply_hashed_log_recs(log_t &log, bool allow_ibuf) {
 
   size_t pct = PCT;
   size_t applied = 0;
+
+  /* 将全量分为10份,用于打印进度 */
   auto unit = batch_size / PCT;
 
+  /* 如果每一份小于10，就直接按一份batchsize */
   if (unit <= PCT) {
     pct = 100;
     unit = batch_size;
@@ -2285,6 +2289,7 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
 
   recv_t *recv;
 
+  /* recv_t 一条redolog */
   recv = static_cast<recv_t *>(mem_heap_alloc(space->m_heap, sizeof(*recv)));
 
   recv->type = type;
@@ -2294,8 +2299,10 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
 
   auto it = space->m_pages.find(page_no);
 
+  /* 哈希表一项，下面挂recv_t的链表，这个page的所有redolog */
   recv_addr_t *recv_addr;
 
+  /* 判断这个page在hash中是否存在 */
   if (it != space->m_pages.end()) {
     recv_addr = it->second;
 
@@ -2313,9 +2320,11 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
 
     space->m_pages.insert(it, value_type(page_no, recv_addr));
 
+    /* hash 中存在的page链表数 */
     ++recv_sys->n_addrs;
   }
 
+  /* 把当前redolog项挂在链表后面 */
   UT_LIST_ADD_LAST(recv_addr->rec_list, recv);
 
   recv_data_t **prev_field;
@@ -2335,6 +2344,7 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
 
     recv_data_t *recv_data;
 
+    /* 结构体和数据存在一起 */
     recv_data = static_cast<recv_data_t *>(
         mem_heap_alloc(space->m_heap, sizeof(*recv_data) + len));
 
@@ -2766,11 +2776,14 @@ static bool recv_single_rec(byte *ptr, byte *end_ptr) {
   /* Try to parse a log record, fetching its type, space id,
   page no, and a pointer to the body of the log record */
 
+  /* 解析一条日志 */
   byte *body;
   mlog_id_t type;
   page_no_t page_no;
   space_id_t space_id;
 
+  /* 这条日志的长度 */
+  /* len 可能落入下一个block */
   ulint len =
       recv_parse_log_rec(&type, ptr, end_ptr, &space_id, &page_no, &body);
 
@@ -2787,6 +2800,7 @@ static bool recv_single_rec(byte *ptr, byte *end_ptr) {
 
   lsn_t new_recovered_lsn;
 
+  /* 把block hdr加回去计算lsn */
   new_recovered_lsn = recv_calc_lsn_on_data_add(old_lsn, len);
 
   if (new_recovered_lsn > recv_sys->scanned_lsn) {
@@ -2794,6 +2808,7 @@ static bool recv_single_rec(byte *ptr, byte *end_ptr) {
     require that also the next log block should
     have been scanned in */
 
+    /* 这条redolog没有结束，需要下一个block的数据 */
     return (true);
   }
 
@@ -2829,6 +2844,7 @@ static bool recv_single_rec(byte *ptr, byte *end_ptr) {
             fil_tablespace_lookup_for_recovery(space_id)) {
 #endif /* !UNIV_HOTBACKUP */
 
+          /* 添加到hash */
           recv_add_to_hash_table(type, space_id, page_no, body, ptr + len,
                                  old_lsn, recv_sys->recovered_lsn);
 
@@ -3028,6 +3044,7 @@ static void recv_parse_log_recs(lsn_t checkpoint_lsn) {
   ut_ad(recv_sys->parse_start_lsn != 0);
 
   for (;;) {
+    /* recovered_lsn初始等于parse_start_lsn */
     byte *ptr = recv_sys->buf + recv_sys->recovered_offset;
 
     byte *end_ptr = recv_sys->buf + recv_sys->len;
@@ -3080,6 +3097,8 @@ static bool recv_sys_add_to_parsing_buf(const byte *log_block,
   ulint more_len;
   ulint data_len = log_block_get_data_len(log_block);
 
+  /* scanned_lsn 是 block 的末尾 */
+  /* parse_start_lsn 是数据的开头 */
   if (recv_sys->parse_start_lsn >= scanned_lsn) {
     return (false);
 
@@ -3087,18 +3106,21 @@ static bool recv_sys_add_to_parsing_buf(const byte *log_block,
     return (false);
 
   } else if (recv_sys->parse_start_lsn > recv_sys->scanned_lsn) {
+    /* 这种情况什么时候会出现 */
     more_len = (ulint)(scanned_lsn - recv_sys->parse_start_lsn);
 
   } else {
     more_len = (ulint)(scanned_lsn - recv_sys->scanned_lsn);
   }
 
+  /* more_lsn 这个block中可以用来parse的数据量 */
   if (more_len == 0) {
     return (false);
   }
 
   ut_ad(data_len >= more_len);
 
+  /* 开始parse的位置 */
   ulint start_offset = data_len - more_len;
 
   if (start_offset < LOG_BLOCK_HDR_SIZE) {
@@ -3114,11 +3136,14 @@ static bool recv_sys_add_to_parsing_buf(const byte *log_block,
   ut_ad(start_offset <= end_offset);
 
   if (start_offset < end_offset) {
+    /* 从log_sys的buf中把log block中的实际数据copy到recv_sys的buf中 */
+    /* 等待parse */
     memcpy(recv_sys->buf + recv_sys->len, log_block + start_offset,
            end_offset - start_offset);
 
     recv_sys->len += end_offset - start_offset;
 
+    /* recv_sys->buf的容量问题已经在外面保证了 */
     ut_a(recv_sys->len <= recv_sys->buf_len);
   }
 
@@ -3167,13 +3192,22 @@ bool meb_scan_log_recs(
   ut_ad(len % OS_FILE_LOG_BLOCK_SIZE == 0);
   ut_ad(len >= OS_FILE_LOG_BLOCK_SIZE);
 
+  /* 处理log_sys->buf中scan_size大小的redolog */
+  /* 处理完成后放入srv_sys->buf(parsing buf)中 */
   do {
+    /* ====== scan 阶段 ====== */
+  
     ut_ad(!finished);
 
+    /* 检查完整写入 */
+
+    /* blockno递增存在blockhdr中，如果出现减小，说明已经达到redolog末尾 */
     ulint no = log_block_get_hdr_no(log_block);
 
+    /* blockno 与 lsn 一一对应 */
     ulint expected_no = log_block_convert_lsn_to_no(scanned_lsn);
 
+    /* end of redo log */
     if (no != expected_no) {
       /* Garbage or an incompletely written log block.
 
@@ -3187,6 +3221,7 @@ bool meb_scan_log_recs(
       break;
     }
 
+    /* 检查日志块checksum */
     if (!log_block_checksum_is_ok(log_block)) {
       uint32_t checksum1 = log_block_get_checksum(log_block);
       uint32_t checksum2 = log_block_calc_checksum(log_block);
@@ -3204,6 +3239,13 @@ bool meb_scan_log_recs(
       break;
     }
 
+    /* scanned_lsn是当前访问的这个位置, */
+    /* 如果包含flush bit，说明这个点之前是被完整flush的, */
+    /* 因此，推进contiguous_lsn到这个点 */
+
+    /* contiguous_lsn是保证小于这个点的redolog
+     * 是完整连续flush的, 并且已经被scan过了（上几轮循环） */
+
     if (log_block_get_flush_bit(log_block)) {
       /* This block was a start of a log flush operation:
       we know that the previous flush operation must have
@@ -3211,13 +3253,17 @@ bool meb_scan_log_recs(
       Therefore, we know that log data is contiguous up to
       scanned_lsn. */
 
+      /* 推进连续flush并被read到buf中的lsn */
       if (scanned_lsn > *contiguous_lsn) {
         *contiguous_lsn = scanned_lsn;
       }
     }
 
+    /* blockhdr中存储的这个block中data的长度 */
+    /* 因为，有可能是一个 incomplete block */
     ulint data_len = log_block_get_data_len(log_block);
 
+    /* redolog 已经循环了, 说明到了redolog末尾 */
     if (scanned_lsn + data_len > recv_sys->scanned_lsn &&
         log_block_get_checkpoint_no(log_block) <
             recv_sys->scanned_checkpoint_no &&
@@ -3232,17 +3278,23 @@ bool meb_scan_log_recs(
       break;
     }
 
+    /* parse_start_lsn == 0 表示 recv 刚开始 */
+    /* 只有开始第一次才需要检查 ckp */
     if (!recv_sys->parse_start_lsn &&
         log_block_get_first_rec_group(log_block) > 0) {
       /* We found a point from which to start the parsing
       of log records */
 
+      /* 去掉block hdr，第一条redolog开始的地方 */
       recv_sys->parse_start_lsn =
           scanned_lsn + log_block_get_first_rec_group(log_block);
 
       ib::info(ER_IB_MSG_1261)
           << "Starting to parse redo log at lsn = " << recv_sys->parse_start_lsn
           << ", whereas checkpoint_lsn = " << recv_sys->checkpoint_lsn;
+
+      /* recv_sys->checkpoint_lsn 和 start_lsn 的关系是什么？ */
+      /* start_lsn = align_down(checkpoint_lsn) */
 
       if (recv_sys->parse_start_lsn < recv_sys->checkpoint_lsn) {
         /* We start to parse log records even before
@@ -3264,6 +3316,8 @@ bool meb_scan_log_recs(
         those records and that's why we need a counter
         of bytes to ignore. */
 
+
+        /* ckp 前面的log 需要被ignore */
         recv_sys->bytes_to_ignore_before_checkpoint =
             recv_sys->checkpoint_lsn - recv_sys->parse_start_lsn;
 
@@ -3278,10 +3332,12 @@ bool meb_scan_log_recs(
              LOG_BLOCK_HDR_SIZE);
       }
 
+      /* 去掉了一些头部信息，推进lsn */
       recv_sys->scanned_lsn = recv_sys->parse_start_lsn;
       recv_sys->recovered_lsn = recv_sys->parse_start_lsn;
     }
 
+    /* 推进一个block，scanned 的意思是检查过 */
     scanned_lsn += data_len;
 
     if (scanned_lsn > recv_sys->scanned_lsn) {
@@ -3305,6 +3361,7 @@ bool meb_scan_log_recs(
       parsing buffer if parse_start_lsn is already
       non-zero */
 
+      /* 保证parsing buf中还有空间可以放入数据 */
       if (recv_sys->len + 4 * OS_FILE_LOG_BLOCK_SIZE >= recv_sys->buf_len) {
         if (!recv_sys_resize_buf()) {
           recv_sys->found_corrupt_log = true;
@@ -3318,16 +3375,20 @@ bool meb_scan_log_recs(
         }
       }
 
-      // log block 去头尾放入 parsedbuf
+      /* copy 一个block的实际内容到parsing buf中 */
       if (!recv_sys->found_corrupt_log) {
         more_data = recv_sys_add_to_parsing_buf(log_block, scanned_lsn);
       }
 
+      /* 两个 scanned_lsn */
+      /* scanned_lsn 是在 logbuf 中检查过的 */
+      /* recv_sys->scanned_lsn 是已经copy到pasing buf中的 */
       recv_sys->scanned_lsn = scanned_lsn;
 
       recv_sys->scanned_checkpoint_no = log_block_get_checkpoint_no(log_block);
     }
 
+    /* incomplete block 表示结尾 */
     if (data_len < OS_FILE_LOG_BLOCK_SIZE) {
       /* Log data for this group ends here */
       finished = true;
@@ -3340,6 +3401,7 @@ bool meb_scan_log_recs(
 
   } while (log_block < buf + len);
 
+  /* 已经在parsing buf中的lsn，等待parsing */
   *read_upto_lsn = scanned_lsn;
 
   if (recv_needed_recovery ||
@@ -3358,6 +3420,8 @@ bool meb_scan_log_recs(
 
 #ifndef UNIV_HOTBACKUP
     if (recv_heap_used() > max_memory) {
+
+      /* 如果hash中已经parse的log足够多，进行一次apply */
       recv_apply_hashed_log_recs(log, false);
     }
 #endif /* !UNIV_HOTBACKUP */
@@ -3385,7 +3449,7 @@ static void recv_read_log_seg(log_t &log, byte *buf, lsn_t start_lsn,
   do {
     lsn_t source_offset;
 
-    // 当前文件中的 offset
+    // 当前log space所有文件中的 offset
     source_offset = log_files_real_offset_for_lsn(log, start_lsn);
 
     ut_a(end_lsn - start_lsn <= ULINT_MAX);
@@ -3396,6 +3460,7 @@ static void recv_read_log_seg(log_t &log, byte *buf, lsn_t start_lsn,
 
     ut_ad(len != 0);
 
+    /* 如果读取数据跨越文件边界，分多次读取 */
     if ((source_offset % log.file_size) + len > log.file_size) {
       /* If the above condition is true then len
       (which is ulint) is > the expression below,
@@ -3476,6 +3541,7 @@ static void recv_recovery_begin(log_t &log, lsn_t *contiguous_lsn) {
   *contiguous_lsn =
       ut_uint64_align_down(*contiguous_lsn, OS_FILE_LOG_BLOCK_SIZE);
 
+  /* lsn 被 align down */
   lsn_t start_lsn = *contiguous_lsn;
 
   lsn_t checkpoint_lsn = start_lsn;
@@ -3487,6 +3553,7 @@ static void recv_recovery_begin(log_t &log, lsn_t *contiguous_lsn) {
     lsn_t end_lsn = start_lsn + RECV_SCAN_SIZE;
 
     // 读取 RECV_SCAN_SIZE 大小的 redolog 到 log_sys->buf 中 
+    // 从 buf 头部开始放置
     recv_read_log_seg(log, log.buf, start_lsn, end_lsn);
 
     // 对读取到的数据进行扫描解析和应用

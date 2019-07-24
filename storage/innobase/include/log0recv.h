@@ -499,10 +499,11 @@ struct recv_sys_t {
   /** Size of the parsing buffer */
   size_t buf_len;
 
-  /* 感觉是与recovered_offset一起使用，循环缓冲区 */
+  /* 当前parse buf中已经存入的数据量 */
   /** Amount of data in buf */
   ulint len;
 
+  /* 为什么不直接用scanned_lsn？因为要去掉block hdr 和 tail */
   /** This is the lsn from which we were able to start parsing
   log records and adding them to the hash table; zero if a suitable
   start point not found yet */
@@ -545,6 +546,8 @@ struct recv_sys_t {
   /** Hash table of pages, indexed by SpaceID. */
   Spaces *spaces;
 
+  /* file addresses 就是 page */
+  /* hash 上挂的page数，每个page上是多个redolog的链表 */
   /** Number of not processed hashed file addresses in the hash table */
   ulint n_addrs;
 

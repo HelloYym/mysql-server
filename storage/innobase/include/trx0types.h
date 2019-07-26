@@ -195,6 +195,7 @@ struct trx_rseg_t {
   RsegMutex mutex;
 
   /** space ID where the rollback segment header is placed */
+  /* 回滚段所在的spage */
   space_id_t space_id;
 
   /** page number of the rollback segment header */
@@ -203,12 +204,14 @@ struct trx_rseg_t {
   /** page size of the relevant tablespace */
   page_size_t page_size;
 
+  /* Rollback Segment中管理的所有Undo页面链表中的Undo页面数量之和的最大值 */
   /** maximum allowed size in pages */
   ulint max_size;
 
   /** current size in pages */
   ulint curr_size;
 
+  /* trx_undo_t 就是undolog分配的page的指针，并将头节点加到rseg的list里 */
   /*--------------------------------------------------------*/
   /* Fields for update undo logs */
   /** List of update undo logs */

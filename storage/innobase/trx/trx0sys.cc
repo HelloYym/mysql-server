@@ -314,6 +314,10 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
     trx_rsegs_init(purge_queue);
   }
 
+/*   每当max_trx_id的值为256的倍数时，就会刷新到系统表空间的页号为5的
+ *   页面中一个称之为Max Trx ID的属性处，这个属性占用8个字节的存储空间。
+ *   当系统重新启动时，将Max Trx ID属性加载到内存中，并加256以保证trxid递增 */
+
   /* VERY important: after the database is started, max_trx_id value is
   divisible by TRX_SYS_TRX_ID_WRITE_MARGIN, and the 'if' in
   trx_sys_get_new_trx_id will evaluate to TRUE when the function
@@ -326,6 +330,7 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
 
   sys_header = trx_sysf_get(&mtr);
 
+  /* 初始化max_trx_id，即下一次分配的trx_id */
   trx_sys->max_trx_id =
       2 * TRX_SYS_TRX_ID_WRITE_MARGIN +
       ut_uint64_align_up(mach_read_from_8(sys_header + TRX_SYS_TRX_ID_STORE),

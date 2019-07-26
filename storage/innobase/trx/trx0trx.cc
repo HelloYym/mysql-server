@@ -1145,11 +1145,15 @@ static trx_rseg_t *get_next_redo_rseg() {
 /** Get the next noredo rollback segment.
 @return assigned rollback segment instance */
 static trx_rseg_t *get_next_temp_rseg() {
+
+  /* static 所有线程共享 */
   static ulint temp_rseg_counter = 0;
   ulong n_rollback_segments = srv_rollback_segments;
 
   ut_ad(n_rollback_segments <= trx_sys->tmp_rsegs.size());
 
+  /* n_rollback_segments是所有回滚段的个数 */
+  /* 为什么不是%temp回滚段的个数 */
   /* Try the next slot that no other thread is looking at */
   ulint slot =
       os_atomic_increment_ulint(&temp_rseg_counter, 1) % n_rollback_segments;
@@ -1179,6 +1183,7 @@ void trx_assign_rseg_temp(trx_t *trx) {
   ut_ad(trx->rsegs.m_noredo.rseg == 0);
   ut_ad(!trx_is_autocommit_non_locking(trx));
 
+  /* 分配临时回滚段函数入口 */
   trx->rsegs.m_noredo.rseg =
       srv_read_only_mode ? nullptr : get_next_temp_rseg();
 

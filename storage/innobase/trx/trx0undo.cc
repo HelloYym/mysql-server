@@ -412,6 +412,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t trx_undo_seg_create(
   if (!srv_inject_too_many_concurrent_trxs)
 #endif
   {
+    /* 在undo slot中循环找到空闲slot */
     slot_no = trx_rsegf_undo_find_free(rseg_hdr, mtr);
   }
   if (slot_no == ULINT_UNDEFINED) {
@@ -451,6 +452,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t trx_undo_seg_create(
 
   trx_undo_page_init(*undo_page, type, mtr);
 
+  /* 把 header 信息写回 undo page */
   mlog_write_ulint(page_hdr + TRX_UNDO_PAGE_FREE,
                    TRX_UNDO_SEG_HDR + TRX_UNDO_SEG_HDR_SIZE, MLOG_2BYTES, mtr);
 
@@ -461,6 +463,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t trx_undo_seg_create(
   flst_add_last(seg_hdr + TRX_UNDO_PAGE_LIST, page_hdr + TRX_UNDO_PAGE_NODE,
                 mtr);
 
+  /* 设置 rseg header 的undoslot */
   trx_rsegf_set_nth_undo(rseg_hdr, slot_no, page_get_page_no(*undo_page), mtr);
   *id = slot_no;
 
@@ -1292,6 +1295,8 @@ static void trx_undo_mem_init_for_reuse(
 
   undo->dict_operation = FALSE;
 
+  /* undo log header 在这个page中的偏移 */
+  /* 前面还有undopage header 和undolog segment header */
   undo->hdr_offset = offset;
   undo->empty = TRUE;
 }
@@ -1328,15 +1333,21 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   ut_ad(mutex_own(&(rseg->mutex)));
 
+  /* 一个回滚段可以支持1024个事务并发 */
+  /* 如果回滚段都用完了，会返回错误DB_TOO_MANY_CONCURRENT_TRXS */
   if (rseg->curr_size == rseg->max_size) {
     return (DB_OUT_OF_FILE_SPACE);
   }
 
+  /* 回滚段中的分配的undo页面数++ */
   rseg->curr_size++;
 
+  /* 先拿到rollback segment header页面 */
+  /* undo slot 存储在这个页面中 */
   rseg_header =
       trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, mtr);
 
+  /* 找到一个空闲的undo slot，并分配新的undolog segment */
   err = trx_undo_seg_create(rseg, rseg_header, type, &id, &undo_page, mtr);
 
   if (err != DB_SUCCESS) {
@@ -1382,6 +1393,7 @@ static trx_undo_t *trx_undo_reuse_cached(
   ut_ad(mutex_own(&(rseg->mutex)));
 
   if (type == TRX_UNDO_INSERT) {
+    /* 从回滚段的insert_undo_cached上取一个缓存的undo_slot */
     undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
     if (undo == NULL) {
       return (NULL);
@@ -1406,9 +1418,13 @@ static trx_undo_t *trx_undo_reuse_cached(
   ut_ad(undo->size == 1);
   ut_a(undo->id < TRX_RSEG_N_SLOTS);
 
+  /* 拿到的是page对象，跟undo 内存对象不同 */
   undo_page = trx_undo_page_get(page_id_t(undo->space, undo->hdr_page_no),
                                 undo->page_size, mtr);
 
+  /* 初始化拿到的undolog header */
+  /* 位置在undo slot对应的第一个链表节点页面 */
+  /* 更新的是页面 */
   if (type == TRX_UNDO_INSERT) {
     offset = trx_undo_insert_header_reuse(undo_page, trx_id, mtr);
 
@@ -1419,9 +1435,11 @@ static trx_undo_t *trx_undo_reuse_cached(
 
     offset = trx_undo_header_create(undo_page, trx_id, mtr);
 
+    /* 预留XID空间 */
     trx_undo_header_add_space_for_xid(undo_page, undo_page + offset, mtr);
   }
 
+  /* 更新的是内存对象 */
   trx_undo_mem_init_for_reuse(undo, trx_id, xid, offset);
 
   return (undo);
@@ -1472,6 +1490,7 @@ dberr_t trx_undo_assign_undo(
   check. */
   ut_ad(trx_is_rseg_assigned(trx));
 
+  /* 当前使用的回滚段 */
   rseg = undo_ptr->rseg;
 
   ut_ad(mutex_own(&(trx->undo_mutex)));
@@ -1488,6 +1507,11 @@ dberr_t trx_undo_assign_undo(
   DBUG_EXECUTE_IF("ib_create_table_fail_too_many_trx",
                   err = DB_TOO_MANY_CONCURRENT_TRXS;
                   goto func_exit;);
+
+  /* 首先总是从cahced list上分配trx_undo_t */
+  /* 当满足某些条件时，事务提交时会将其拥有的trx_undo_t放到 */
+  /* cached list上，这样新的事务可以重用这些undo 对象，而无需去扫描回滚段 */
+
   undo =
 #ifdef UNIV_DEBUG
       srv_inject_too_many_concurrent_trxs
@@ -1496,6 +1520,7 @@ dberr_t trx_undo_assign_undo(
 #endif
           trx_undo_reuse_cached(trx, rseg, type, trx->id, trx->xid, &mtr);
 
+  /* 没有可重用undo_t */
   if (undo == nullptr) {
     err = trx_undo_create(trx, rseg, type, trx->id, trx->xid, &undo, &mtr);
     if (err != DB_SUCCESS) {
@@ -1503,6 +1528,7 @@ dberr_t trx_undo_assign_undo(
     }
   }
 
+  /* 添加到rseg内部的undo链表上 */
   if (type == TRX_UNDO_INSERT) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_list, undo);
     ut_ad(undo_ptr->insert_undo == NULL);
@@ -1513,6 +1539,9 @@ dberr_t trx_undo_assign_undo(
     undo_ptr->update_undo = undo;
   }
 
+  /* 如果是数据词典操作（DDL）产生的undo，主要是表级别操作， */
+  /* 例如创建或删除表，还需要记录操作的table id到undo log header中 */
+  /* 同时将TRX_UNDO_DICT_TRANS设置为TRUE */
   if (trx->mysql_thd && !trx->ddl_operation &&
       thd_is_dd_update_stmt(trx->mysql_thd)) {
     trx->ddl_operation = true;

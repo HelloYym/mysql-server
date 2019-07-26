@@ -2037,10 +2037,13 @@ dberr_t trx_undo_report_row_operation(
 
   ut_ad(thr);
   ut_ad(!srv_read_only_mode);
+  /* insert或者update类型 */
   ut_ad((op_type != TRX_UNDO_INSERT_OP) || (clust_entry && !update && !rec));
 
   trx = thr_get_trx(thr);
 
+  /* 判断当前变更的是否是临时表 */
+  /* 如果是临时表，则采用临时表回滚段来分配，否则采用普通的回滚段 */
   bool is_temp_table = index->table->is_temporary();
 
   /* Temporary tables do not go into INFORMATION_SCHEMA.TABLES,
@@ -2055,12 +2058,14 @@ dberr_t trx_undo_report_row_operation(
   ut_ad(!trx->read_only || is_temp_table);
 
   /* If this is a temp-table then we assign temporary rseg. */
+  /* 临时回滚段：系统表空间5号页面，第1-31个rseg槽指向的回滚段 */
   if (is_temp_table && trx->rsegs.m_noredo.rseg == nullptr) {
     trx_assign_rseg_temp(trx);
   }
 
   mtr_start(&mtr);
 
+  /* undo_ptr是该事务已经分配的某个类型的回滚段 */
   if (is_temp_table) {
     /* If object is temporary, disable REDO logging that
     is done to track changes done to UNDO logs. This is
@@ -2081,11 +2086,13 @@ dberr_t trx_undo_report_row_operation(
   }
 #endif /* UNIV_DEBUG */
 
+  根据当前操作的类型，在回滚段中找到或者申请一个undo链表
   switch (op_type) {
     case TRX_UNDO_INSERT_OP:
       undo = undo_ptr->insert_undo;
 
       if (undo == NULL) {
+        /* 分配insert undo slot */
         err = trx_undo_assign_undo(trx, undo_ptr, TRX_UNDO_INSERT);
         undo = undo_ptr->insert_undo;
 
@@ -2104,6 +2111,7 @@ dberr_t trx_undo_report_row_operation(
       undo = undo_ptr->update_undo;
 
       if (undo == NULL) {
+        /* 分配 update undo slot */
         err = trx_undo_assign_undo(trx, undo_ptr, TRX_UNDO_UPDATE);
         undo = undo_ptr->update_undo;
 

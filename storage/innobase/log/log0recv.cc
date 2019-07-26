@@ -3760,6 +3760,9 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
   // 主要流程
   recv_recovery_begin(log, &contiguous_lsn);
 
+  /* hash 中应该还有一部分page没有apply */
+  /* 因为只有达到容量才进行apply */
+
   lsn_t recovered_lsn;
 
   recovered_lsn = recv_sys->recovered_lsn;
@@ -3811,6 +3814,7 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
            OS_FILE_LOG_BLOCK_SIZE);
   }
 
+  /* 初始化log */
   log_start(log, checkpoint_no + 1, checkpoint_lsn, recovered_lsn);
 
   /* Copy the checkpoint info to the log; remember that we have
@@ -3825,6 +3829,9 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
   mutex_enter(&recv_sys->mutex);
   recv_sys->apply_log_recs = true;
   mutex_exit(&recv_sys->mutex);
+
+  /* 事务回滚可以在用户线程启动后在后台进行 */
+  /* 反正回滚事务相当于没有结束，与正常事务一起进行 */
 
   /* The database is now ready to start almost normal processing of user
   transactions: transaction rollbacks and the application of the log

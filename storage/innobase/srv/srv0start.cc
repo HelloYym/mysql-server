@@ -2498,6 +2498,8 @@ files_checked:
       return (srv_init_abort(DB_ERROR));
     }
 
+    /* redolog 恢复完成，数据库恢复到崩溃前的状态 */
+
     /* We have successfully recovered from the redo log. The
     data dictionary should now be readable. */
 
@@ -2651,6 +2653,8 @@ files_checked:
       return (srv_init_abort(err));
     }
 
+    /* 初始化事务子系统 */
+    /* 可以通过回滚段找到崩溃前活跃的rw事务 */
     purge_queue = trx_sys_init_at_db_start();
 
     if (srv_is_upgrade_mode) {

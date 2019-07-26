@@ -667,6 +667,7 @@ and sometimes by trx->mutex.
 
 * Killing of asynchronous transactions. */
 
+/* 一个事务的某个回滚段，包括这个回滚段的指针，以及两个trx_undo_t链表 */
 /** Represents an instance of rollback segment along with its state variables.*/
 struct trx_undo_ptr_t {
   trx_rseg_t *rseg;        /*!< rollback segment assigned to the
@@ -678,6 +679,7 @@ struct trx_undo_ptr_t {
                            NULL if no update performed yet */
 };
 
+/* 一个事务可能分配两个回滚段，正常表的和临时表的 */
 /** Rollback segments assigned to a transaction for undo logging. */
 struct trx_rsegs_t {
   /** undo log ptr holding reference to a rollback segment that resides in

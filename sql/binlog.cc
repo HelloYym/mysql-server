@@ -3710,6 +3710,8 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
                                     bool need_lock_index) {
   bool error = false;
   File index_file_nr = -1;
+
+  // 要打开 index 文件，要先上锁
   if (need_lock_index)
     mysql_mutex_lock(&LOCK_index);
   else
@@ -3722,6 +3724,7 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
   */
   myf opt = MY_UNPACK_FILENAME;
 
+  // index file 是 binlog 的成员变量，用于文件缓冲
   if (my_b_inited(&index_file)) goto end;
 
   if (!index_file_name_arg) {
@@ -3731,11 +3734,13 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
   fn_format(index_file_name, index_file_name_arg, mysql_data_home, ".index",
             opt);
 
+  // set_crash_safe_index_file 是 binlog index 文件 crash safe 的辅助文件
   if (set_crash_safe_index_file_name(index_file_name_arg)) {
     error = true;
     goto end;
   }
 
+  // 如果有 crash 文件，就将 crash 文件设置为当前的 log index
   /*
     We need move crash_safe_index_file to index_file if the index_file
     does not exist and crash_safe_index_file exists when mysqld server
@@ -3750,6 +3755,7 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
     goto end;
   }
 
+  // 打开 index 文件，sync 文件，初始化 IO_CACHE
   if ((index_file_nr = mysql_file_open(m_key_file_log_index, index_file_name,
                                        O_RDWR | O_CREAT, MYF(MY_WME))) < 0 ||
       mysql_file_sync(index_file_nr, MYF(MY_WME)) ||
@@ -3776,6 +3782,7 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
     any binary log file that was created but not register in the index
     due to a crash.
   */
+  // purge 目录下的 binlog 文件，不在 index file 里面记录
 
   if (set_purge_index_file_name(index_file_name_arg) ||
       open_purge_index_file(false) || purge_index_entry(NULL, NULL, false) ||
@@ -4722,6 +4729,7 @@ bool MYSQL_BIN_LOG::open_binlog(
 
   mysql_mutex_assert_owner(get_log_lock());
 
+  // 生成下一个 binlog 文件名 eg：./binlog.000004
   if (init_and_set_log_file_name(log_name, new_name, new_index_number)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_GENERATE_NEW_FILE_NAME);
     DBUG_RETURN(1);
@@ -4731,6 +4739,10 @@ bool MYSQL_BIN_LOG::open_binlog(
 
   DEBUG_SYNC(current_thd, "after_log_file_name_initialized");
 
+  // 为什么先写入 purge index file ？
+  // 最后再写入 index file，这样如果文件出错，可以 diff 两个 index file
+  //
+  // purge index file 可能有上次运行时 没有 purge 完的 entry
   if (open_purge_index_file(true) ||
       register_create_index_entry(log_file_name) || sync_purge_index_file() ||
       DBUG_EVALUATE_IF("fault_injection_registering_index", 1, 0)) {
@@ -4777,6 +4789,7 @@ bool MYSQL_BIN_LOG::open_binlog(
 #endif
   Format_description_log_event s;
 
+  // 新文件：写入 header 等信息
   if (m_binlog_file->is_empty()) {
     /*
       The binary log file was empty (probably newly created)
@@ -5149,6 +5162,8 @@ fatal_err:
   @retval
     -1   error
 */
+
+// 在 index file 里面增加一项 binlog file name
 int MYSQL_BIN_LOG::add_log_to_index(uchar *log_name, size_t log_name_len,
                                     bool need_lock_index) {
   DBUG_ENTER("MYSQL_BIN_LOG::add_log_to_index");
@@ -5277,10 +5292,17 @@ static int compare_log_name(const char *log_1, const char *log_2) {
     LOG_INFO_IO		Got IO error while reading file
 */
 
+/* 结果： */
+/* linfo->index_file_start_offset = index file 该项的起始偏移 bytes; */
+/* linfo->index_file_offset = index file 该项的结束偏移 bytes */
+/* 如果 log_name 是 NULLS ，返回的 offset 是 0 */
+
 int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo, const char *log_name,
                                 bool need_lock_index) {
   int error = 0;
   char *full_fname = linfo->log_file_name;
+  // full log name：要查找的文件 完整的绝对路径
+  // fname: 循环读取 index file 中的每一行的文件名
   char full_log_name[FN_REFLEN], fname[FN_REFLEN];
   DBUG_ENTER("find_log_pos");
   full_log_name[0] = full_fname[0] = 0;
@@ -5310,6 +5332,7 @@ int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo, const char *log_name,
   DBUG_PRINT("enter", ("log_name: %s, full_log_name: %s",
                        log_name ? log_name : "NULL", full_log_name));
 
+  // 从 index file 起始处开始遍历
   /* As the file is flushed, we can't get an error here */
   my_b_seek(&index_file, (my_off_t)0);
 
@@ -5381,8 +5404,11 @@ int MYSQL_BIN_LOG::find_next_log(LOG_INFO *linfo, bool need_lock_index) {
     goto err;
   }
   /* As the file is flushed, we can't get an error here */
+
+  // 当前 index entry 的末尾，在 find_log_pos 中获得
   my_b_seek(&index_file, linfo->index_file_offset);
 
+  // 读取了 index file 中的下一行
   linfo->index_file_start_offset = linfo->index_file_offset;
   if ((length = my_b_gets(&index_file, fname, FN_REFLEN)) <= 1) {
     error = !index_file.error ? LOG_INFO_EOF : LOG_INFO_IO;
@@ -5716,12 +5742,15 @@ int MYSQL_BIN_LOG::close_crash_safe_index_file() {
 */
 int MYSQL_BIN_LOG::remove_logs_from_index(LOG_INFO *log_info,
                                           bool need_update_threads) {
+
+  // 建立一个 crash safe 文件
   if (open_crash_safe_index_file()) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_OPEN_TMP_INDEX,
            "MYSQL_BIN_LOG::remove_logs_from_index");
     goto err;
   }
 
+  // 将 index file 中不需要删除的 entry 复制到  crash safe 文件
   if (copy_file(&index_file, &crash_safe_index_file,
                 log_info->index_file_start_offset)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_COPY_INDEX_TO_TMP,
@@ -5729,6 +5758,8 @@ int MYSQL_BIN_LOG::remove_logs_from_index(LOG_INFO *log_info,
     goto err;
   }
 
+  
+  // 关闭 并刷盘
   if (close_crash_safe_index_file()) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_CLOSE_TMP_INDEX,
            "MYSQL_BIN_LOG::remove_logs_from_index");
@@ -5736,6 +5767,7 @@ int MYSQL_BIN_LOG::remove_logs_from_index(LOG_INFO *log_info,
   }
   DBUG_EXECUTE_IF("fault_injection_copy_part_file", DBUG_SUICIDE(););
 
+  // 将 crash file 设置为 新的 index file 
   if (move_crash_safe_index_file_to_index_file(
           false /*need_lock_index=false*/)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_MOVE_TMP_TO_INDEX,
@@ -5801,6 +5833,7 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
 
   no_of_log_files_to_purge = log_info.entry_index;
 
+  // 建立一个 .~rec~ 文件，保存 要删除的 binlog 文件名
   if ((error = open_purge_index_file(true))) {
     LogErr(ERROR_LEVEL, ER_BINLOG_PURGE_LOGS_CANT_SYNC_INDEX_FILE);
     goto err;
@@ -5813,6 +5846,15 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
   if ((error = find_log_pos(&log_info, NullS, false /*need_lock_index=false*/)))
     goto err;
 
+  // compare 结果：
+  //
+  // 0:
+  // 没有到达 purge 的文件名
+  // 继续
+  //
+  // <>0:
+  // 当前到达 to_log 位置
+  // 那么 检查 included 条件
   while ((compare_log_name(to_log, log_info.log_file_name) ||
           (exit_loop = included))) {
     if (is_active(log_info.log_file_name)) {
@@ -5832,20 +5874,28 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
                             no_of_log_files_purged, no_of_log_files_to_purge);
       break;
     }
+
+    // 本次删除的 log 文件数
     no_of_log_files_purged++;
 
+    // 把当前的 log name 写进 purge index file 里
+    // 还没 flush 到磁盘
     if ((error = register_purge_index_entry(log_info.log_file_name))) {
       LogErr(ERROR_LEVEL, ER_BINLOG_PURGE_LOGS_CANT_COPY_TO_REGISTER_FILE,
              log_info.log_file_name);
       goto err;
     }
 
+    // 不需要 lock logindex 因为在循环之前已经上锁了
+    // 如果 当前到达 to_log，直接 break
     if (find_next_log(&log_info, false /*need_lock_index=false*/) || exit_loop)
       break;
   }
 
   DBUG_EXECUTE_IF("crash_purge_before_update_index", DBUG_SUICIDE(););
 
+  // 将 purge index file 内容刷盘
+  // .~rec~ 文件中：要删除的 binlog 文件
   if ((error = sync_purge_index_file())) {
     LogErr(ERROR_LEVEL, ER_BINLOG_PURGE_LOGS_CANT_FLUSH_REGISTER_FILE);
     goto err;
@@ -5873,6 +5923,7 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
 err:
 
   int error_index = 0, close_error_index = 0;
+
   /* Read each entry from purge_index_file and delete the file. */
   if (!error && is_inited_purge_index_file() &&
       (error_index = purge_index_entry(thd, decrease_log_space,
@@ -5896,9 +5947,12 @@ err:
   DBUG_RETURN(error);
 }
 
+// purge index file: purge 中间阶段保存 要删除的 binlog 文件名，即 index entry
+
 int MYSQL_BIN_LOG::set_purge_index_file_name(const char *base_file_name) {
   int error = 0;
   DBUG_ENTER("MYSQL_BIN_LOG::set_purge_index_file_name");
+  // 添加了后缀：path/master-log-bin.~rec~
   if (fn_format(
           purge_index_file_name, base_file_name, mysql_data_home, ".~rec~",
           MYF(MY_UNPACK_FILENAME | MY_SAFE_PATH | MY_REPLACE_EXT)) == NULL) {
@@ -5931,6 +5985,7 @@ int MYSQL_BIN_LOG::open_purge_index_file(bool destroy) {
   DBUG_RETURN(error);
 }
 
+// 关闭 &  删除 purge index log 临时文件
 int MYSQL_BIN_LOG::close_purge_index_file() {
   int error = 0;
 
@@ -5955,6 +6010,11 @@ int MYSQL_BIN_LOG::sync_purge_index_file() {
   int error = 0;
   DBUG_ENTER("MYSQL_BIN_LOG::sync_purge_index_file");
 
+  // 需要两步：
+  // purge_index_file 是 mysql 自己的 IO cache
+  //
+  // 1: flush 到 OS 的 page cache
+  // 2: sync 到磁盘
   if ((error = flush_io_cache(&purge_index_file)) ||
       (error = my_sync(purge_index_file.file, MYF(MY_WME))))
     DBUG_RETURN(error);
@@ -5962,6 +6022,7 @@ int MYSQL_BIN_LOG::sync_purge_index_file() {
   DBUG_RETURN(error);
 }
 
+// 读取 log index 文件，匹配每一个 binlog，写入到 purge index file
 int MYSQL_BIN_LOG::register_purge_index_entry(const char *entry) {
   int error = 0;
   DBUG_ENTER("MYSQL_BIN_LOG::register_purge_index_entry");
@@ -5979,6 +6040,8 @@ int MYSQL_BIN_LOG::register_create_index_entry(const char *entry) {
   DBUG_RETURN(register_purge_index_entry(entry));
 }
 
+
+// 根据 purge index 文件，删除 binlog 文件
 int MYSQL_BIN_LOG::purge_index_entry(THD *thd, ulonglong *decrease_log_space,
                                      bool need_lock_index) {
   MY_STAT s;

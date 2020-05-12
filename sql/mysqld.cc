@@ -5059,6 +5059,7 @@ static int init_server_components() {
   }
 
   if (opt_bin_log) {
+    // 检查 binlog 和 binlog index 不能是文件夹
     /* Reports an error and aborts, if the --log-bin's path
        is a directory.*/
     if (opt_bin_logname &&
@@ -5078,8 +5079,10 @@ static int init_server_components() {
       unireg_abort(MYSQLD_ABORT_EXIT);
     }
 
+    // FN_REFLEN=512 是 mysql 允许的最大路径长度
     char buf[FN_REFLEN];
     const char *ln;
+    // log_bin 是否 enable
     if (log_bin_supplied) {
       /*
         Binary log basename defaults to "`hostname`-bin" name prefix
@@ -5094,6 +5097,7 @@ static int init_server_components() {
       ln = mysql_bin_log.generate_name(opt_bin_logname, "", buf);
     }
 
+    // 用户打开了 log-bin 选项，但是没有指定路径，提示 warning 
     if (!opt_bin_logname && !opt_binlog_index_name && log_bin_supplied) {
       /*
         User didn't give us info to name the binlog index file.
@@ -5104,6 +5108,8 @@ static int init_server_components() {
       */
       LogErr(INFORMATION_LEVEL, ER_LOG_BIN_BETTER_WITH_NAME, ln);
     }
+
+    // 重新构造了 logname
     if (ln == buf) {
       my_free(opt_bin_logname);
       opt_bin_logname = my_strdup(key_memory_opt_bin_logname, buf, MYF(0));
@@ -5114,6 +5120,8 @@ static int init_server_components() {
       to avoid creating the file in an otherwise empty datadir, which will
       cause a succeeding 'mysqld --initialize' to fail.
     */
+
+    // binlog 初始化 step1: 打开 index 文件
     if (!is_help_or_validate_option() &&
         mysql_bin_log.open_index_file(opt_binlog_index_name, ln, true)) {
       unireg_abort(MYSQLD_ABORT_EXIT);
@@ -5126,6 +5134,7 @@ static int init_server_components() {
       not an empty string, incase it is an empty string default file
       extension will be passed
      */
+    // 在这里设置 log_bin_basename 全局变量
     if (log_bin_supplied) {
       log_bin_basename = rpl_make_log_name(
           key_memory_MYSQL_BIN_LOG_basename, opt_bin_logname,
@@ -5137,6 +5146,7 @@ static int init_server_components() {
                             default_binlogfile_name, "");
     }
 
+    // 设置 log_bin_index 全局变量
     log_bin_index =
         rpl_make_log_name(key_memory_MYSQL_BIN_LOG_index, opt_binlog_index_name,
                           log_bin_basename, ".index");
@@ -5637,6 +5647,7 @@ static int init_server_components() {
     mysql_mutex_t *log_lock = mysql_bin_log.get_log_lock();
     mysql_mutex_lock(log_lock);
 
+    // 在数据库启动阶段会重新 rotate 一个新的 binlog 文件
     if (mysql_bin_log.open_binlog(opt_bin_logname, 0, max_binlog_size, false,
                                   true /*need_lock_index=true*/,
                                   true /*need_sid_lock=true*/, NULL)) {
@@ -5661,6 +5672,7 @@ static int init_server_components() {
     binlog_expire_logs_seconds = 0;
   DBUG_ASSERT(expire_logs_days == 0 || binlog_expire_logs_seconds == 0);
 
+  // 根据事件 purge 无用的 binlog
   if (opt_bin_log) {
     if (expire_logs_days > 0 || binlog_expire_logs_seconds > 0) {
       time_t purge_time = my_time(0) - binlog_expire_logs_seconds -

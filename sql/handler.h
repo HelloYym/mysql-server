@@ -2210,6 +2210,8 @@ struct Page_track_t {
   to provide access to storage engine functionality that works on the
   "global" level (unlike handler class that works on a per-table basis).
 
+  每个 storage engine 有自己的定义
+  eg. ha_innodb.cc
   usually handlerton instance is defined statically in ha_xxx.cc as
 
   static handlerton { ... } xxx_hton;

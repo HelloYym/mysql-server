@@ -310,6 +310,14 @@ static bool xarecover_handlerton(THD *, plugin_ref plugin, void *arg) {
   int got;
 
   if (hton->state == SHOW_OPTION_YES && hton->recover) {
+
+    // hton->recover 获取 storage engine 中 prepared 状态的 xid
+    // innodb 中对应于 ha_innodb.cc:innobase_xa_recover 函数
+    // return number of prepared transactions stored in xid_list
+    //
+    // 为什么要用 while 循环
+    // 因为：info->list 的容量是有限的，每次只能获取 info->len 个 xid
+
     while (
         (got = hton->recover(
              hton, info->list, info->len,
@@ -358,6 +366,7 @@ static bool xarecover_handlerton(THD *, plugin_ref plugin, void *arg) {
           hton->rollback_by_xid(hton, &info->list[i].id);
         }
       }
+      // 是否还有待获取的 xid
       if (got < info->len) break;
     }
   }
@@ -369,6 +378,14 @@ int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
   DBUG_ENTER("ha_recover");
   info.found_foreign_xids = info.found_my_xids = 0;
   info.commit_list = commit_list;
+
+  // commit_list = 0 表示所有 prepared 的都要回滚 
+  // innodb：prepared 阶段的事务肯定属于 last binlog
+  //         因为，binlog rotate 时候已经强制 commit 了
+  //
+  // prepared 是什么阶段？
+  // 开启 xa 后，innodb 事务会有 prepared 阶段
+  // group commit
   info.dry_run =
       (info.commit_list == 0 && tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
   info.list = NULL;
@@ -376,13 +393,16 @@ int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
   /* commit_list and tc_heuristic_recover cannot be set both */
   DBUG_ASSERT(info.commit_list == 0 ||
               tc_heuristic_recover == TC_HEURISTIC_NOT_USED);
+
   /* if either is set, total_ha_2pc must be set too */
   DBUG_ASSERT(info.dry_run || total_ha_2pc > (ulong)opt_bin_log);
 
   if (total_ha_2pc <= (ulong)opt_bin_log) DBUG_RETURN(0);
 
+  // 如果 commit list 里有 XID ，开始 recover
   if (info.commit_list) LogErr(SYSTEM_LEVEL, ER_XA_STARTING_RECOVERY);
 
+  // 不只一个 存储引擎
   if (total_ha_2pc > (ulong)opt_bin_log + 1) {
     if (tc_heuristic_recover == TC_HEURISTIC_RECOVER_ROLLBACK) {
       LogErr(ERROR_LEVEL, ER_XA_NO_MULTI_2PC_HEURISTIC_RECOVER);
@@ -398,8 +418,11 @@ int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
     info.dry_run = false;
   }
 
+  // 能申请到最大的 数组？？？
+  // 申请这么多干什么？？？
   for (info.len = MAX_XID_LIST_SIZE;
        info.list == 0 && info.len > MIN_XID_LIST_SIZE; info.len /= 2) {
+    // 每次分配失败返回 空指针
     info.list = new (std::nothrow) XA_recover_txn[info.len];
   }
   if (!info.list) {

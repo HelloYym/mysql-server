@@ -5292,10 +5292,11 @@ static int compare_log_name(const char *log_1, const char *log_2) {
     LOG_INFO_IO		Got IO error while reading file
 */
 
-/* 结果： */
-/* linfo->index_file_start_offset = index file 该项的起始偏移 bytes; */
-/* linfo->index_file_offset = index file 该项的结束偏移 bytes */
-/* 如果 log_name 是 NULLS ，返回的 offset 是 0 */
+// 结果：
+// linfo->log_file_name = 匹配项，即 某个 binlog 的文件名
+// linfo->index_file_start_offset = index file 该项的起始偏移 bytes;
+// linfo->index_file_offset = index file 该项的结束偏移 bytes
+// 如果 log_name 是 NULLS ，返回的是 index 文件中的第一项
 
 int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo, const char *log_name,
                                 bool need_lock_index) {
@@ -5349,6 +5350,7 @@ int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo, const char *log_name,
       break;
     }
 
+    最后一次循环的 entry 存在了 full_fname 中，即 log_info->log_file_name
     // extend relative paths and match against full path
     if (normalize_binlog_name(full_fname, fname, is_relay_log)) {
       error = LOG_INFO_EOF;
@@ -5388,6 +5390,8 @@ end:
   @retval LOG_INFO_EOF End of log-index-file found
   @retval LOG_INFO_IO Got IO error while reading file
 */
+// linfo 是当前的 index entry
+// 包括 binlog filename 和在 index file 中的 offset
 int MYSQL_BIN_LOG::find_next_log(LOG_INFO *linfo, bool need_lock_index) {
   int error = 0;
   size_t length;
@@ -7664,6 +7668,13 @@ void MYSQL_BIN_LOG::set_max_size(ulong max_size_arg) {
 */
 
 int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
+
+  // 2pc 的作用：协调多个存储引擎的 log 间的同步，包含 server 层的 binlog
+  //
+  // 将普通事务当做 mysql 内部的 XA 事务处理，为每个事务分配一个 XID
+  // 协调者：这个函数
+  // 参与者：多个引擎和 binlog
+
   LOG_INFO log_info;
   int error = 1;
 
@@ -7672,15 +7683,21 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
     is never used for relay logs.
   */
   DBUG_ASSERT(!is_relay_log);
+
+  // 参与者至少有 2 个，innodb 和 binlog
   DBUG_ASSERT(total_ha_2pc > 1 || (1 == total_ha_2pc && opt_bin_log));
   DBUG_ASSERT(opt_name && opt_name[0]);
 
+  // 确保 index 文件初始化成功
   if (!my_b_inited(&index_file)) {
     /* There was a failure to open the index file, can't open the binlog */
     cleanup();
     return 1;
   }
 
+  // 启发式恢复逻辑：
+  // 假如数据库奔溃之后 binlog 文件损坏无法担任协调者的角色
+  // 对于 prepare 的事务可以人为的选择是提交还是回滚
   if (using_heuristic_recover()) {
     /* generate a new binlog to mask a corrupted one */
     mysql_mutex_lock(&LOCK_log);
@@ -7692,6 +7709,7 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
     return 1;
   }
 
+  // 找到 index 文件中的第一个 binlog
   if ((error = find_log_pos(&log_info, NullS, true /*need_lock_index=true*/))) {
     if (error != LOG_INFO_EOF)
       LogErr(ERROR_LEVEL, ER_BINLOG_CANT_FIND_LOG_IN_INDEX, error);
@@ -7706,6 +7724,7 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
     my_off_t valid_pos = 0;
     my_off_t binlog_size = 0;
 
+    // 找到 index 文件中最后一个 binlog entry
     do {
       strmake(log_name, log_info.log_file_name, sizeof(log_name) - 1);
     } while (
@@ -7717,6 +7736,11 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
     }
 
     Binlog_file_reader binlog_file_reader(opt_master_verify_checksum);
+
+    // 打开最后一个 binlog 文件
+    // 会校验文件头的 magic number
+    // 如果 magic number 校验失败，会直接报错退出，无法完成recovery
+    // 如果确定最后一个binlog没有内容，可以删除binlog 文件再重试
     if (binlog_file_reader.open(log_name)) {
       LogErr(ERROR_LEVEL, ER_BINLOG_FILE_OPEN_FAILED,
              binlog_file_reader.get_error_str());
@@ -9017,11 +9041,25 @@ commit_stage:
                         event(non-transaction) of the crashed binlog.
                         valid_pos must be non-NULL.
 
+  通过 binlog 来判读 innodb 等引擎是否需要回滚
+
   After a crash, storage engines may contain transactions that are
   prepared but not committed (in theory any engine, in practice
   InnoDB).  This function uses the binary log as the source of truth
   to determine which of these transactions should be committed and
   which should be rolled back.
+
+  遍历最后一个 binlog 中的所有 event，将事务结尾的 XID 添加到 hash
+  hash 中的 XID 对应的事务 相当于 已经在 binlog 这里 commit 了
+
+  将 hash 发送到 innodb
+
+  由 innodb 自己判断:
+  在 innodb 里处于 prepared 状态的事务（即 redolog 已经 flush） 是否需要回滚：
+  （这里的 prepared 和 commited 状态是全局的，应该跟 innodb 自己的 commit 无关?）
+  1. 如果 XID 在 hash 里面，说明 innodb 和 binlog 都已经完成了 事务的执行，可以 commit
+  2. 如果 XID 不在 hash 里，说明 innodb 已经 commit 了，但是 binlog 还没有 commit
+     2PC 没有成功，需要回滚
 
   The function collects the XIDs of all transactions that are
   completely written to the binary log into a hash, and passes this
@@ -9030,11 +9068,13 @@ commit_stage:
   prepared transactions that are in the set, and to roll back all
   prepared transactions that are not in the set.
 
+  遍历最后一个 binlog 文件，读取每个 event ，对于 XID event 放到 hash
   To compute the hash, this function iterates over the last binary log
   only (i.e. it assumes that 'log' is the last binary log).  It
   instantiates each event.  For XID-events (i.e. commit to InnoDB), it
   extracts the xid from the event and stores it in the hash.
 
+  之前的 binlog 中的 事务都已经 commit 了，rotate 时候进行的
   It is enough to iterate over only the last binary log because when
   the binary log is rotated we force engines to commit (and we fsync
   the old binary log).
@@ -9048,27 +9088,41 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
   /*
     The flag is used for handling the case that a transaction
     is partially written to the binlog.
+    标记 一个 事务是否 完整写入 binlog 
   */
   bool in_transaction = false;
   int memory_page_size = my_getpagesize();
 
   {
+    // hash
     MEM_ROOT mem_root(key_memory_binlog_recover_exec, memory_page_size);
     memroot_unordered_set<my_xid> xids(&mem_root);
 
+    // switch event type
+    // note: strcmp sb function!
     while ((ev = binlog_file_reader->read_event_object())) {
       if (ev->get_type_code() == binary_log::QUERY_EVENT &&
           !strcmp(((Query_log_event *)ev)->query, "BEGIN"))
+        // begin event 开启事务
         in_transaction = true;
+
+      // commit 和 xid event 都表示结束一个 事务
+      // xid event 表示 binlog 这里的事务已经 prepared 
 
       if (ev->get_type_code() == binary_log::QUERY_EVENT &&
           !strcmp(((Query_log_event *)ev)->query, "COMMIT")) {
+
+        // 事务 commit event 之前一定有 begin
         DBUG_ASSERT(in_transaction == true);
         in_transaction = false;
       } else if (ev->get_type_code() == binary_log::XID_EVENT ||
                  is_atomic_ddl_event(ev)) {
         my_xid xid;
 
+        // atomic ddl 会记录 gtid event？有自己的 XID
+        // 但是不更新 valid pos
+
+        // 提取 event 中的 xid
         if (ev->get_type_code() == binary_log::XID_EVENT) {
           DBUG_ASSERT(in_transaction == true);
           in_transaction = false;
@@ -9116,6 +9170,9 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
           <---> HERE IS VALID <--->
           ...
       */
+      // 这次的 event 如果把事务 commit 了，则可以更新 pos
+      // 即，pos 记录最后的完整的事务
+      // gtid event 不更新 valid pos ，为什么？
       if (!in_transaction && !is_gtid_event(ev))
         *valid_pos = binlog_file_reader->position();
 
@@ -9123,6 +9180,7 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
     }
 
     /*
+      至少有一个存储引擎 + binlog
       Call ha_recover if and only if there is a registered engine that
       does 2PC, otherwise in DBUG builds calling ha_recover directly
       will result in an assert. (Production builds would be safe since

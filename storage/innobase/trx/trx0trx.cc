@@ -2788,6 +2788,7 @@ int trx_recover_for_mysql(
 
   trx_sys_mutex_enter();
 
+  // trx_sys 有 trx 的链表
   for (trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != NULL;
        trx = UT_LIST_GET_NEXT(trx_list, trx)) {
     assert_trx_in_rw_list(trx);

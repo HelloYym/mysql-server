@@ -872,6 +872,7 @@ class binlog_cache_data {
     Storage for byte data. This binlog_cache_data will serialize
     events into bytes and put them into m_cache.
   */
+  // 实际的 cache
   Binlog_cache_storage m_cache;
 
   /*
@@ -1010,6 +1011,8 @@ class binlog_trx_cache_data : public binlog_cache_data {
   binlog_trx_cache_data(const binlog_trx_cache_data &info);
 };
 
+
+// 这个类中包含了两个 cache，其中包含一些方法用于访问这两个cache
 class binlog_cache_mngr {
  public:
   binlog_cache_mngr(ulong *ptr_binlog_stmt_cache_use_arg,
@@ -1069,13 +1072,21 @@ class binlog_cache_mngr {
                          be touched.
     @return Error code on error, zero if no error.
    */
+  // 每个事务有两个 cache 需要 flush 到 binlog 文件
+  // 分别存 transactional statements 和 nontransactional statements 
   int flush(THD *thd, my_off_t *bytes_written, bool *wrote_xid) {
     my_off_t stmt_bytes = 0;
     my_off_t trx_bytes = 0;
+
+    // 非事务型 event 不能包含 xid
+    //
+    // cache 里面包含了多个 event，同属于一个待提交的事务
     DBUG_ASSERT(stmt_cache.has_xid() == 0);
     int error = stmt_cache.flush(thd, &stmt_bytes, wrote_xid);
     if (error) return error;
     DEBUG_SYNC(thd, "after_flush_stm_cache_before_flush_trx_cache");
+
+    // 写入trx cache
     if (int error = trx_cache.flush(thd, &trx_bytes, wrote_xid)) return error;
     *bytes_written = stmt_bytes + trx_bytes;
     return 0;
@@ -1097,6 +1108,8 @@ class binlog_cache_mngr {
             !is_binlog_empty());
   }
 
+  // 继承来自统一的父类binlog_cache_data
+  // binlog_trx_cache_data要实现更多的功能，因为要支持事物，支持事物的回滚等功能
   binlog_stmt_cache_data stmt_cache;
   binlog_trx_cache_data trx_cache;
   /*
@@ -1452,6 +1465,7 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
   @retval false Success.
   @retval true Error.
 */
+// gtid 写入在 两个 binlog cache 之前
 bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
                                Binlog_event_writer *writer) {
   DBUG_ENTER("MYSQL_BIN_LOG::write_gtid");
@@ -1460,6 +1474,7 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     The GTID for the THD was assigned at
     assign_automatic_gtids_to_flush_group()
   */
+  // 事务在主库上执行并提交，此时会给事务分配一个 gtid，该值会被写入到 binlog 中
   DBUG_ASSERT(thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS ||
               thd->owned_gtid.sidno > 0);
 
@@ -1479,6 +1494,8 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     condition trn_ctx->last_committed==SEQ_UNINIT to detect this
     situation, hence the need to set it here.
   */
+
+  // 如果连个binlog cache 都非空，那一个要在另一个后面执行，用这个字段连接
   thd->get_transaction()->last_committed = SEQ_UNINIT;
 
   /*
@@ -1487,6 +1504,7 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     executing this code (the time of writing the Gtid_log_event to the binary
     log).
   */
+  // 事务 commit 的时间戳 设定为，写入 gtid event 时刻的时间戳
   ulonglong immediate_commit_timestamp = my_micro_time();
 
   /*
@@ -1509,10 +1527,12 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
       originated on the current server).
     */
     if (thd->slave_thread || thd->is_binlog_applier()) {
+      // slave 上 original commit timestamp 是0，因为 not known
       original_commit_timestamp = 0;
     } else
     /* Assume that this transaction is original from this server */
     {
+      // master 上的新事务，变量也是 0
       DBUG_EXECUTE_IF("rpl_invalid_gtid_timestamp",
                       // add one our to the commit timestamps
                       immediate_commit_timestamp += 3600000000;);
@@ -1520,6 +1540,7 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     }
   } else {
     // Clear the session variable to have cleared states for next transaction.
+    // reset 这个变量，下次就能直接判断了
     thd->variables.original_commit_timestamp = UNDEFINED_COMMIT_TIMESTAMP;
   }
 
@@ -1898,9 +1919,12 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
       }
     };);
 
+    // 在写binlog cache 之前，先写入gtid
     if (!error)
       if ((error = mysql_bin_log.write_gtid(thd, this, &writer)))
         thd->commit_error = THD::CE_FLUSH_ERROR;
+
+    // 将binlog cache 文件写入binlog 文件
     if (!error) error = mysql_bin_log.write_cache(thd, this, &writer);
 
     if (flags.with_xid && error == 0) *wrote_xid = true;
@@ -1909,6 +1933,7 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
       Reset have to be after the if above, since it clears the
       with_xid flag
     */
+    // 清空cache
     reset();
     if (bytes_written) *bytes_written = bytes_in_cache;
   }
@@ -2222,8 +2247,15 @@ bool Stage_manager::Mutex_queue::append(THD *first) {
              ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
               (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
   int32 count = 1;
+
+  // 链表是否是 空
   bool empty = (m_first == NULL);
+
+  // 队列的末尾元素的 next_to_commit 位置
+  // 直接 指向了 first
+  // 如果队列为空，那之前清空的时候 m_last == m_first
   *m_last = first;
+  
   DBUG_PRINT("info",
              ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
               (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
@@ -2233,12 +2265,16 @@ bool Stage_manager::Mutex_queue::append(THD *first) {
     the queue as well.
   */
 
+  // 参数 first 可以是一个 list，把多个 thd 加入队列
+  // 遍历 first 链表，找到最后一个 thd 和元素个数
   while (first->next_to_commit) {
     count++;
     first = first->next_to_commit;
   }
   m_size += count;
 
+  // 指针的指针
+  // 队列的尾指针，下次直接填充为参数 first
   m_last = &first->next_to_commit;
   DBUG_PRINT("info",
              ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
@@ -2288,6 +2324,7 @@ bool Stage_manager::enroll_for(StageID stage, THD *thd,
     mngr->unregister_trx(worker);
   }
 
+  // binlog rotate 对应的 event 不需要加锁，因为 rotate 时候已经加了
   /*
     We do not need to unlock the stage_mutex if it is LOCK_log when rotating
     binlog caused by logging incident log event, since it should be held
@@ -2301,6 +2338,7 @@ bool Stage_manager::enroll_for(StageID stage, THD *thd,
     The stage mutex can be NULL if we are enrolling for the first
     stage.
   */
+  // 释放上一个 stage 的lock
   if (stage_mutex && need_unlock_stage_mutex) mysql_mutex_unlock(stage_mutex);
 
 #ifndef DBUG_OFF
@@ -2343,6 +2381,8 @@ bool Stage_manager::enroll_for(StageID stage, THD *thd,
     thd->get_transaction()->m_flags.ready_preempt = 1;
     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
 #endif
+    // m_cond_done 条件变量，用于接收 signal
+    // thd->tx_commit_pending 判断提交是否成功
     while (thd->tx_commit_pending) mysql_cond_wait(&m_cond_done, &m_lock_done);
     mysql_mutex_unlock(&m_lock_done);
   }
@@ -2357,6 +2397,8 @@ THD *Stage_manager::Mutex_queue::fetch_and_empty() {
               (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
   THD *result = m_first;
   m_first = NULL;
+
+  // 把m_last指向队列当前末尾
   m_last = &m_first;
   DBUG_PRINT("info",
              ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
@@ -3528,6 +3570,10 @@ static int find_uniq_filename(char *name, uint32 new_index_number) {
     my_stpcpy(end, ".1");                              // use name+1
     DBUG_RETURN(1);
   }
+  
+  // 遍历data目录下的所有文件
+  // 找到 binlog.0001 这种 binlog 文件
+  // 判断最后一个 binlog 文件编号
   file_info = dir_info->dir_entry;
   for (i = dir_info->number_off_files; i--; file_info++) {
     if (strncmp(file_info->name, start, length) == 0 &&
@@ -3537,6 +3583,9 @@ static int find_uniq_filename(char *name, uint32 new_index_number) {
   }
   my_dirend(dir_info);
 
+  // 超过最大的编号限制
+  // 不管 --binlog_error_action=IGNORE_ERROR/ABORT_SERVER 如何设置
+  // 都会 abort server
   /* check if reached the maximum possible extension number */
   if (max_found >= MAX_LOG_UNIQUE_FN_EXT) {
     LogErr(ERROR_LEVEL, ER_BINLOG_FILE_EXTENSION_NUMBER_EXHAUSTED, max_found);
@@ -3577,6 +3626,9 @@ static int find_uniq_filename(char *name, uint32 new_index_number) {
     goto end;
   }
 
+  // MAX_ALLOWED_FN_EXT_RESET_MASTER 比 MAX_LOG_UNIQUE_FN_EXT 小一些
+  // 超过这个界限后不会 abort
+  // 但是 warning 还剩余的 编号数
   /* print warning if reaching the end of available extensions. */
   if (next > MAX_ALLOWED_FN_EXT_RESET_MASTER)
     LogErr(WARNING_LEVEL, ER_BINLOG_FILE_EXTENSION_NUMBER_RUNNING_LOW, next,
@@ -3595,6 +3647,7 @@ int MYSQL_BIN_LOG::generate_new_name(char *new_name, const char *log_name,
         my_printf_error(ER_NO_UNIQUE_LOGFILE,
                         ER_THD(current_thd, ER_NO_UNIQUE_LOGFILE),
                         MYF(ME_FATALERROR), log_name);
+      // 如果获取下一个 binlog file 失败，直接 abort server
       LogErr(ERROR_LEVEL, ER_FAILED_TO_GENERATE_UNIQUE_LOGFILE, log_name);
       return 1;
     }
@@ -3629,6 +3682,8 @@ const char *MYSQL_BIN_LOG::generate_name(const char *log_name,
 bool MYSQL_BIN_LOG::init_and_set_log_file_name(const char *log_name,
                                                const char *new_name,
                                                uint32 new_index_number) {
+  // 如果给出了 new_name 就直接复制过去
+  // my_stpcpy 返回值：pointer to terminating null byte
   if (new_name && !my_stpcpy(log_file_name, new_name))
     return true;
   else if (!new_name &&
@@ -7208,6 +7263,7 @@ bool MYSQL_BIN_LOG::do_write_cache(Binlog_cache_storage *cache,
 #endif
 
   bool error = false;
+  // 将 cache 里面的 bytes 拷贝到 binlog 文件里面
   if (cache->copy_to(writer, &error)) {
     if (error) report_binlog_write_error();
     DBUG_RETURN(true);
@@ -7461,6 +7517,7 @@ bool MYSQL_BIN_LOG::write_cache(THD *thd, binlog_cache_data *cache_data,
         DBUG_PRINT("info", ("crashing before writing xid"));
         DBUG_SUICIDE();
       });
+      // 调用实际的写 binlog 的函数
       if (do_write_cache(cache, writer)) goto err;
 
       const char *err_msg =
@@ -7474,6 +7531,7 @@ bool MYSQL_BIN_LOG::write_cache(THD *thd, binlog_cache_data *cache_data,
       }
       DBUG_EXECUTE_IF("half_binlogged_transaction", DBUG_SUICIDE(););
     }
+    // 更新当前thd 的文件坐标，用于复制
     update_thd_next_event_pos(thd);
   }
 
@@ -7659,6 +7717,10 @@ void MYSQL_BIN_LOG::set_max_size(ulong max_size_arg) {
 
 /****** transaction coordinator log for 2pc - binlog() based solution ******/
 
+// 若打开binlog，且使用了事务引擎，则XA控制对象为mysql_bin_log
+// mysql_bin_log tc_log_mmap tc_log_dummy 都是 TC_LOG 的子类
+
+
 /**
   @todo
   keep in-memory list of prepared transactions
@@ -7767,6 +7829,7 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
       LogErr(INFORMATION_LEVEL, ER_BINLOG_RECOVERING_AFTER_CRASH_USING,
              opt_name);
       valid_pos = binlog_file_reader.position();
+      // 调用xa恢复
       error = binlog_recover(&binlog_file_reader, &valid_pos);
       binlog_size = binlog_file_reader.ifile()->length();
     } else
@@ -8193,7 +8256,11 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all) {
    is assigned to the transaction.
  */
 std::pair<int, my_off_t> MYSQL_BIN_LOG::flush_thread_caches(THD *thd) {
+  // 获得某个线程的 binlog cache
+  // 即该线程对应的事务已经写入到 binlog cache 里面了，等待事务提交
+  // binlog_cache_mngr 包含两个 binlog cache，是 cache 统一的对外接口
   binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
+
   my_off_t bytes = 0;
   bool wrote_xid = false;
   int error = cache_mngr->flush(thd, &bytes, &wrote_xid);
@@ -8203,6 +8270,8 @@ std::pair<int, my_off_t> MYSQL_BIN_LOG::flush_thread_caches(THD *thd) {
       this function documentation for more info.
     */
     thd->set_trans_pos(log_file_name, m_binlog_file->position());
+
+    // 更新xid，并将thd 的flags.write_xid置位
     if (wrote_xid) inc_prep_xids(thd);
   }
   DBUG_PRINT("debug", ("bytes: %llu", bytes));
@@ -8243,19 +8312,43 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
     for guaranteeing to flush prepared records of transactions before
     flushing them to binary log, which is required by crash recovery.
   */
+
+  // leader 线程在这里取出了当前的 flush queue
+  // flush queue 链表重置为 空
+  //
+  // 这个时刻之后进来的线程会在 change_stage 里面竞争成为新的 leader
+  // 但是会在 change_stage 里等待当前线程释放 flush 阶段的 lock
+
   THD *first_seen = stage_manager.fetch_queue_for(Stage_manager::FLUSH_STAGE);
   DBUG_ASSERT(first_seen != NULL);
+
   /*
     We flush prepared records of transactions to the log of storage
     engine (for example, InnoDB redo log) in a group right before
     flushing them to binary log.
   */
+
+  // -------------xa prepare---------------
+  //
+  // redo log 批量刷盘 
+  // 将 innodb 中 prepared 状态的事务 刷入 redolog
+  // log_buffer_flush_to_disk 将所有已经申请了 logbuffer 位置的事务刷盘 
+  // 即，这些事务已经填充了 mtr，准备写入 logbuffer 了
   ha_flush_logs(true);
   DBUG_EXECUTE_IF("crash_after_flush_engine_log", DBUG_SUICIDE(););
   assign_automatic_gtids_to_flush_group(first_seen);
+
+  // -------------xa commit---------------
+  // --------1. flush binlog---------------
+  
+  // binlog 批量刷盘 
   /* Flush thread caches to binary log. */
   for (THD *head = first_seen; head; head = head->next_to_commit) {
+
+    // 队列中每一个 thd 都进行 cache 刷盘
     std::pair<int, my_off_t> result = flush_thread_caches(head);
+
+    // 更新总共的写入bytes
     total_bytes += result.second;
     if (flush_error == 1) flush_error = result.first;
 #ifndef DBUG_OFF
@@ -8265,6 +8358,8 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
 
   *out_queue_var = first_seen;
   *total_bytes_var = total_bytes;
+
+  // 如果 binlog 文件超过了 max_size，则准备切换 rotate，设置 rotate_var=true
   if (total_bytes > 0 &&
       (m_binlog_file->get_real_file_size() >= (my_off_t)max_size ||
        DBUG_EVALUATE_IF("simulate_max_binlog_size", true, false)))
@@ -8333,6 +8428,7 @@ void MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first) {
       /*
         storage engine commit
        */
+      // 让 innodb 进行 thd 的 commit，完成提交
       if (ha_commit_low(head, all, false))
         head->commit_error = THD::CE_COMMIT_ERROR;
     }
@@ -8435,10 +8531,23 @@ bool MYSQL_BIN_LOG::change_stage(THD *thd MY_ATTRIBUTE((unused)),
   DBUG_ASSERT(0 <= stage && stage < Stage_manager::STAGE_COUNTER);
   DBUG_ASSERT(enter_mutex);
   DBUG_ASSERT(queue);
+
+  // 先入队，再释放上一阶段的 lock，最后申请下一阶段的 lock 
+  // 保证了线程的顺序性
+  // 即，每个 stage 都只有一个线程在执行
+  // 在某个 stage queue 堆积的时候也是按顺序进入队列的
+  //
+  // 反之，如果先释放上一个 stage lock，再入队
+  // 就可能多个线程同时申请入队，无法保证顺序性
+  //
+  // 如果，先申请下一个 lock，再释放当前 lock
+  // 那整个过程变成了串行提交，违背 group commit 思想
+
   /*
     enroll_for will release the leave_mutex once the sessions are
     queued.
   */
+  // Follower 线程会等待直到被 Leader 线程唤醒，然后返回 true
   if (!stage_manager.enroll_for(stage, queue, leave_mutex)) {
     DBUG_ASSERT(!thd_get_cache_mngr(thd)->dbug_any_finalized());
     DBUG_RETURN(true);
@@ -8456,6 +8565,10 @@ bool MYSQL_BIN_LOG::change_stage(THD *thd MY_ATTRIBUTE((unused)),
   bool need_lock_enter_mutex =
       !(is_rotating_caused_by_incident && enter_mutex == &LOCK_log);
 
+  // leader 申请 stage lock
+  // 不会有多个线程同时等待
+  // 因为，只有每个 stage queue 的 leader 会申请下一个 stage lock
+  // 而 stage leader 的选举通过上一个 stage lock 保证
   if (need_lock_enter_mutex)
     mysql_mutex_lock(enter_mutex);
   else
@@ -8544,6 +8657,9 @@ int MYSQL_BIN_LOG::finish_commit(THD *thd) {
     m_dependency_tracker.update_max_committed(thd);
     mysql_mutex_unlock(&LOCK_slave_trans_dep_tracker);
   }
+
+  // 如果 leader 对 commit queue 中的 thd 进行了统一提交
+  // 这里的 m_flags.commit_low = false，避免重复提交
   if (thd->get_transaction()->m_flags.commit_low) {
     const bool all = thd->get_transaction()->m_flags.real_commit;
     /*
@@ -8793,6 +8909,8 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   */
 
   if (has_commit_order_manager(thd)) {
+    // slave relay log 的执行信息，SQL thread
+    // slave_worker 是 rli_slave 的子类
     Slave_worker *worker = dynamic_cast<Slave_worker *>(thd->rli_slave);
     Commit_order_manager *mngr = worker->get_commit_order_manager();
 
@@ -8801,8 +8919,13 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
       DBUG_RETURN(thd->commit_error);
     }
 
+    // 这个函数只有 Leader 线程才会返回 false
+    // Follower 线程会等待直到被 Leader 线程唤醒，然后返回 true
+    // flush stage 的 lock 是 LOCK_log
     if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, NULL, &LOCK_log))
+      // 调用 finish_commit 退出函数 MYSQL_BIN_LOG::ordered_commit，表示提交完成
       DBUG_RETURN(finish_commit(thd));
+
   } else if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, NULL,
                           &LOCK_log)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
@@ -8815,6 +8938,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   my_off_t flush_end_pos = 0;
   bool update_binlog_end_pos_after_sync;
   if (unlikely(!is_open())) {
+
     final_queue = stage_manager.fetch_queue_for(Stage_manager::FLUSH_STAGE);
     leave_mutex_before_commit_stage = &LOCK_log;
     /*
@@ -8826,6 +8950,16 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     goto commit_stage;
   }
   DEBUG_SYNC(thd, "waiting_in_the_middle_of_flush_stage");
+
+  // 开始将当前 flush queue 中的 thd binlog cache 刷到 binlog 文件的 pagecache
+  // 
+  // leader 线程在这里取出了当前的 flush queue
+  // flush queue 重置为 空
+  //
+  // 这个时刻之后进来的第一个线程会在 change_stage 里面成为 leader
+  // 但是会在 change_stage 里等待当前线程释放 flush 阶段的 lock
+  //
+  // 因此，当前 queue flush 的时候，新的 flush queue 中会积累多个 thd
   flush_error =
       process_flush_stage_queue(&total_bytes, &do_rotate, &wait_queue);
 
@@ -8868,6 +9002,18 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     Stage #2: Syncing binary log file to disk
   */
 
+  // enroll_for 函数中:
+  // 当前的 flush stage leader 先入队，再释放前一阶段的 lock
+  // 因此，每两个 change_stage 函数间，只有一个 leader 线程在执行
+  // 保证了入队的顺序性！见 change_stage 函数注释
+  //
+  // 之后的 flush leader 可以开始进行 flush 过程
+  //
+  // 当前 leader 线程带着 flush queue 入队，
+  // 可能成为 sync leader，也可能成为 follower
+  // 因为，之前进入 sync stage 的线程还在等更之前的 sync 线程释放 lock
+  // 相当于 多个 flush queue 组成了一个 sync queue
+
   if (change_stage(thd, Stage_manager::SYNC_STAGE, wait_queue, &LOCK_log,
                    &LOCK_sync)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
@@ -8883,15 +9029,46 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     it is considered as a special case and delay will be executed
     for every group just like how it is done when sync_binlog= 1.
   */
+  //
+  // sync_counter 是之前积压的个数，加上当前这次的 1
+  // get_sync_period() 表示几个 group 提交一次，而不是几个 thd 提交一次
+  //                   每次执行到这里，说明group leader进来了，即一个新的group
+  //
+  // 1. 如果 (sync_counter + 1 >= get_sync_period())，说明这次会执行 sync
+  // 那么，稍等一会，更多的 thd 进入到 sync queue
+  //
+  // 2. 如果这次不执行 sync，没有必要等待
+  //
+  // 特殊情况：
+  // 1. sync_binlog=0：每次 sync 都要等待，
+  //    因为，group commit 三个阶段一定要有等待，不然就不成组了
+  // 2. sync_binlog=1：每次 sync 都要等待，因为每次都要提交
+  //
   if (!flush_error && (sync_counter + 1 >= get_sync_period()))
     stage_manager.wait_count_or_timeout(
         opt_binlog_group_commit_sync_no_delay_count,
         opt_binlog_group_commit_sync_delay, Stage_manager::SYNC_STAGE);
 
+  // leader 线程在这里取出了当前的 sync queue
+  // sync queue 重置为 空
+  //
+  // 这个时刻之后进入 sync stage 的 flush leader 线程
+  // 会在 change_stage 里面成为 leader
+  //
+  // 但是会在 change_stage 里等待当前线程释放 sync lock
+  //
+  // 因此，当前 queue sync 的时候，新的 sync queue 中会积累多个 flush queue
+  //
+  // 那么可以预料，没到达 sync_period 的时候，当前线程快速通过 sync stage
+  // 新的 sync queue 比较短就会被取出
+  // 如果到达了 sync_period，新的 sync queue 就会积压更多的 flush queue
   final_queue = stage_manager.fetch_queue_for(Stage_manager::SYNC_STAGE);
 
   if (flush_error == 0 && total_bytes > 0) {
     DEBUG_SYNC(thd, "before_sync_binlog_file");
+
+    // 每调用一次 sync 把 sync_counter +1
+    // 如果 sync_counter 没到达 sync_period 直接进入 commit stage
     std::pair<bool, bool> result = sync_binlog_file(false);
     sync_error = result.first;
   }
@@ -8928,8 +9105,11 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     commit stage if binlog_error_action is ABORT_SERVER.
   */
 commit_stage:
+  // opt_binlog_order_commits 是否由leader一起做commit
   if (opt_binlog_order_commits &&
       (sync_error == 0 || binlog_error_action != ABORT_SERVER)) {
+
+    // 由commit leader对队列中的所有thd进行commit
     if (change_stage(thd, Stage_manager::COMMIT_STAGE, final_queue,
                      leave_mutex_before_commit_stage, &LOCK_commit)) {
       DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
@@ -8968,8 +9148,12 @@ commit_stage:
     process_after_commit_stage_queue(thd, commit_queue);
     final_queue = commit_queue;
   } else {
+
+    // 如果不进行 order commit，那么 sync leader 还没有 change stage
+    // 需要我们手动释放 sync lock
     if (leave_mutex_before_commit_stage)
       mysql_mutex_unlock(leave_mutex_before_commit_stage);
+
     if (flush_error == 0 && sync_error == 0)
       sync_error = call_after_sync_hook(final_queue);
   }
@@ -8982,6 +9166,9 @@ commit_stage:
 
   DEBUG_SYNC(thd, "before_signal_done");
   /* Commit done so signal all waiting threads */
+
+  // 通知所有等待的线程
+  // 通过 thd->tx_commit_pending 标志来通知 thd
   stage_manager.signal_done(final_queue);
   DBUG_EXECUTE_IF("block_leader_after_delete", {
     const char action[] = "now SIGNAL leader_proceed";
@@ -9000,6 +9187,7 @@ commit_stage:
     If we need to rotate, we do it without commit error.
     Otherwise the thd->commit_error will be possibly reset.
    */
+  // do_rotate 标志位在 flush 阶段被设置
   if (DBUG_EVALUATE_IF("force_rotate", 1, 0) ||
       (do_rotate && thd->commit_error == THD::CE_NONE &&
        !is_rotating_caused_by_incident)) {
@@ -9041,7 +9229,7 @@ commit_stage:
                         event(non-transaction) of the crashed binlog.
                         valid_pos must be non-NULL.
 
-  通过 binlog 来判读 innodb 等引擎是否需要回滚
+  通过 binlog 来判断 innodb 等引擎是否需要回滚
 
   After a crash, storage engines may contain transactions that are
   prepared but not committed (in theory any engine, in practice
@@ -9117,6 +9305,9 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
         in_transaction = false;
       } else if (ev->get_type_code() == binary_log::XID_EVENT ||
                  is_atomic_ddl_event(ev)) {
+
+        // 什么阶段写入 xid event ？
+        
         my_xid xid;
 
         // atomic ddl 会记录 gtid event？有自己的 XID
@@ -9208,6 +9399,7 @@ void MYSQL_BIN_LOG::update_binlog_end_pos(bool need_lock) {
 
 inline void MYSQL_BIN_LOG::update_binlog_end_pos(const char *file,
                                                  my_off_t pos) {
+  /* 更新binlog 文件的末尾 */
   lock_binlog_end_pos();
   if (is_active(file) && (pos > atomic_binlog_end_pos))
     atomic_binlog_end_pos = pos;

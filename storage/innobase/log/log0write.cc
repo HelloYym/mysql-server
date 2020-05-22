@@ -788,8 +788,11 @@ We do not care if it's flushed or not.
 @param[in]	lsn	wait until log.write_lsn >= lsn
 @return		statistics related to waiting inside */
 static Wait_stats log_wait_for_write(const log_t &log, lsn_t lsn) {
+
+  // 相当于 notify 一下 log writer
   os_event_set(log.writer_event);
 
+  // 根据系统状态自动计算 spin 周期
   const uint64_t max_spins = log_max_spins_when_waiting_in_user_thread(
       srv_log_wait_for_write_spin_delay);
 
@@ -798,6 +801,9 @@ static Wait_stats log_wait_for_write(const log_t &log, lsn_t lsn) {
       return (true);
     }
 
+    // 如果到了 wait 阶段
+    // 每次唤醒后就 notify 一次 log_writer
+    // 催一下
     if (wait) {
       os_event_set(log.writer_event);
     }
@@ -806,6 +812,8 @@ static Wait_stats log_wait_for_write(const log_t &log, lsn_t lsn) {
     return (false);
   };
 
+  // & (n - 1) 相当于 取模
+  // 计算 lsn 属于第几个 event slot
   size_t slot =
       (lsn - 1) / OS_FILE_LOG_BLOCK_SIZE & (log.write_events_size - 1);
 
@@ -886,6 +894,15 @@ Wait_stats log_write_up_to(log_t &log, lsn_t end_lsn, bool flush_to_disk) {
   Note that redo log is actually flushed, because changes to the page
   are caused by applying the redo. */
 
+  // recover 时进入了 apply redolog 阶段
+  // 根据 hash 中的 redolog 对 buffer pool 中的 page 进行更新
+  // 如果 buffer pool 的容量不足，需要将 page 刷盘
+  // page 刷盘的逻辑需要 redolog 落盘到指定的 lsn
+  // 进入了这个函数
+  //
+  // 但这种情况下 redolog 肯定已经落盘了
+  //
+  // recover 阶段，redolog 不能进行写入操作
   if (recv_no_ibuf_operations) {
     /* Recovery is running and no operations on the log files are
     allowed yet, which is implicitly deduced from the fact, that
@@ -904,33 +921,49 @@ Wait_stats log_write_up_to(log_t &log, lsn_t end_lsn, bool flush_to_disk) {
 
   ut_a(end_lsn != LSN_MAX);
 
+  // end_lsn 在新的log block 起始位置
+  // 或者 在 log hdr 之后，即 log block 之中
   ut_a(end_lsn % OS_FILE_LOG_BLOCK_SIZE == 0 ||
        end_lsn % OS_FILE_LOG_BLOCK_SIZE >= LOG_BLOCK_HDR_SIZE);
 
+  // 没有到达 file tail 里面
   ut_a(end_lsn % OS_FILE_LOG_BLOCK_SIZE <=
        OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_TRL_SIZE);
 
+  // ut_ad 只有 debug 模式会检查
   ut_ad(end_lsn <= log_get_lsn(log));
 
+  // 是否需要 flush 到磁盘
   if (flush_to_disk) {
+
+    // flush 的位点已经超过 请求的lsn了，不需要等待直接返回
     if (log.flushed_to_disk_lsn.load() >= end_lsn) {
       return (Wait_stats{0});
     }
 
     Wait_stats wait_stats{0};
 
+    // 参数为不等于1，writer 线程写完不会通知 flusher 线程
+    // 并且 flusher 每次自动启动的间隔是 1s
+    // 为了本函数能快速返回
+    // 所以我们显式调用 log_wait_for_flush 函数来保证 flush
+
     if (srv_flush_log_at_trx_commit != 1) {
       /* We need redo flushed, but because trx != 1, we have
       disabled notifications sent from log_writer to log_flusher.
 
       The log_flusher might be sleeping for 1 second, and we need
-      quick response here. Log_writer avoids waking up log_flusher,
+      quick response here. log_writer avoids waking up log_flusher,
       so we must do it ourselves here.
 
       However, before we wake up log_flusher, we must ensure that
       log.write_lsn >= lsn. Otherwise log_flusher could flush some
       data which was ready for lsn values smaller than end_lsn and
       return to sleeping for next 1 second. */
+
+      // 在调用 wait flush 之前应该确保：
+      // write_lsn 已经抵达 end_lsn 了
+      // 否则，flush 一次也没到 end_lsn，又要等 1s 下次唤醒
 
       if (log.write_lsn.load() < end_lsn) {
         wait_stats = log_wait_for_write(log, end_lsn);
@@ -941,6 +974,7 @@ Wait_stats log_write_up_to(log_t &log, lsn_t end_lsn, bool flush_to_disk) {
     return (wait_stats + log_wait_for_flush(log, end_lsn));
 
   } else {
+    // write 到 page cache 的位点超过 end_lsn 就可以了
     if (log.write_lsn.load() >= end_lsn) {
       return (Wait_stats{0});
     }
@@ -2356,6 +2390,8 @@ void log_flusher(log_t *log_ptr) {
  *******************************************************/
 
 /* @{ */
+
+// 通知在 slot 中 wait 的线程
 
 void log_write_notifier(log_t *log_ptr) {
   ut_a(log_ptr != nullptr);

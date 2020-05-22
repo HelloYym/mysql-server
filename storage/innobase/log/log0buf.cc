@@ -1005,6 +1005,9 @@ void log_buffer_flush_to_disk(log_t &log, bool sync) {
   ut_a(!srv_read_only_mode);
   ut_a(!recv_recovery_is_on());
 
+  // 返回已经分配的lsn的末尾
+  // 即：下一个可以分配的 lsn
+  // 全部事务都 write 结束
   const lsn_t lsn = log_get_lsn(log);
 
   log_write_up_to(log, lsn, sync);

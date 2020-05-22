@@ -413,5 +413,3 @@ typedef Basic_binlog_file_reader<Relaylog_ifile, Binlog_event_data_istream,
                                  Binlog_event_object_istream,
                                  Default_binlog_event_allocator>
     Relaylog_file_reader;
-#endif  // MYSQL_SERVER
-#endif  // BINLOG_READER_INCLUDED

@@ -5162,6 +5162,14 @@ static bool innobase_flush_logs(handlerton *hton, bool binlog_group_flush) {
     DBUG_RETURN(false);
   }
 
+  // 只有两种情况进入这个 flush log 函数：
+  //   1. binlog group commit
+  //   2. flush logs 语句
+  //
+  // flush logs 语句一定要执行 flush
+  // binlog group commit 可以选择性执行，根据srv_flush_log_at_trx_commit 
+  // srv_flush_log_at_trx_commit = 0 时 redolog 周期性写入 pagecache 
+
   /* If !binlog_group_flush, we got invoked by FLUSH LOGS or similar.
   Else, we got invoked by binlog group commit during flush stage. */
 
@@ -5181,6 +5189,8 @@ static bool innobase_flush_logs(handlerton *hton, bool binlog_group_flush) {
   Sync it to disc if we are in FLUSH LOGS, or if
   innodb_flush_log_at_trx_commit=1
   (write and sync at each commit). */
+
+  // 参数：是否等到 flush 结束再返回
   log_buffer_flush_to_disk(!binlog_group_flush ||
                            srv_flush_log_at_trx_commit == 1);
 

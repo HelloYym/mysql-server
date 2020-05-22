@@ -2196,6 +2196,7 @@ void THD::mark_transaction_to_rollback(bool all) {
   transaction_rollback_request = all;
 }
 
+// 设置 binlog_next_event_pos (filename, pos) 文件坐标，用于 replication
 void THD::set_next_event_pos(const char *_filename, ulonglong _pos) {
   char *&filename = binlog_next_event_pos.file_name;
   if (filename == NULL) {

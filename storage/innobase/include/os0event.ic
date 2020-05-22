@@ -71,16 +71,23 @@ inline static Wait_stats os_event_wait_for(os_event_t &event,
   constexpr uint64_t MAX_TIMEOUT_US = 100 * 1000;
 
   while (true) {
-    /* Store current sig_count before checking the
-    condition, not to miss notification. */
+
+    // 如果已经到达 spin 的上限，就开始进入 event wait
     const bool wait = spins_limit == 0;
 
+    /* Store current sig_count before checking the
+    condition, not to miss notification. */
+
+    // 记录当前的 signal ，如果有 signal，那后面就不需要 wait 了
     const int64_t sig_count = !wait ? 0 : os_event_reset(event);
 
     /* Important: we do not want to split this loop to two
     loops (one for spin-delay and one for event), because
     we assume the condition is inlined below, and we don't
     want to make it inlined in two places. */
+
+    // 因为 cond 是 inline 函数，
+    // 所以最好不分成两个循环分别做 spin 和 wait
 
     if (condition(wait)) {
       return (Wait_stats{waits});
@@ -90,12 +97,14 @@ inline static Wait_stats os_event_wait_for(os_event_t &event,
       /* It's still spin-delay loop. */
       --spins_limit;
 
+      // 每次 spin 之间短暂释放 cpu
       UT_RELAX_CPU();
 
     } else {
       /* Event-based loop. */
       ++waits;
 
+      // 如果 wait 次数过多，则延长 wait timeout 时间
       if (waits == next_level) {
         timeout = std::min(timeout * 2, MAX_TIMEOUT_US);
 

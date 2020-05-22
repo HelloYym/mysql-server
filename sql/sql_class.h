@@ -1530,6 +1530,7 @@ class THD : public MDL_context_owner,
     these positions instead of maintaining three different ones.
    */
   /**@{*/
+  // 这两个变量什么区别
   const char *m_trans_log_file;
   char *m_trans_fixed_log_file;
   my_off_t m_trans_end_pos;

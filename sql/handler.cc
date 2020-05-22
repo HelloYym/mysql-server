@@ -1798,6 +1798,8 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit) {
 
   DBUG_ENTER("ha_commit_low");
 
+  // 实际调用 binlog_commit 和 innobase_commit
+
   if (ha_info) {
     bool restore_backup_ha_data = false;
     /*

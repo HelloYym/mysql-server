@@ -37,10 +37,14 @@ bool IO_CACHE_ostream::open(
     const char *file_name, myf flags) {
   File file = -1;
 
+  // 打开的文件 offset 在 0，因为没有使用 O_APPEND
+  // 这里通常是新文件
   if ((file = mysql_file_open(log_file_key, file_name, O_CREAT | O_WRONLY,
                               MYF(MY_WME))) < 0)
     return true;
 
+  // seek = 0
+  // IO_cache 的大小固定，不能调节
   if (init_io_cache(&m_io_cache, file, IO_SIZE, WRITE_CACHE, 0, 0, flags)) {
     mysql_file_close(file, MYF(0));
     return true;
@@ -62,6 +66,7 @@ bool IO_CACHE_ostream::seek(my_off_t offset) {
   return reinit_io_cache(&m_io_cache, WRITE_CACHE, offset, false, true);
 }
 
+
 bool IO_CACHE_ostream::write(const unsigned char *buffer, my_off_t length) {
   DBUG_ASSERT(my_b_inited(&m_io_cache));
   DBUG_EXECUTE_IF("simulate_ostream_write_failure", return true;);
@@ -80,8 +85,10 @@ bool IO_CACHE_ostream::truncate(my_off_t offset) {
 
 bool IO_CACHE_ostream::flush() {
   DBUG_ASSERT(my_b_inited(&m_io_cache));
+  // 会调用 my_write 把 io cache 写入 file
   return flush_io_cache(&m_io_cache);
 }
+
 
 bool IO_CACHE_ostream::sync() {
   DBUG_ASSERT(my_b_inited(&m_io_cache));

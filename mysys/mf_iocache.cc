@@ -191,6 +191,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   info->buffer = 0;
   info->seek_not_done = false;
 
+  // 找到文件当前位置
   if (file >= 0) {
     pos = mysql_file_tell(file, MYF(0));
     if ((pos == (my_off_t)-1) && (my_errno() == ESPIPE)) {
@@ -214,6 +215,9 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
 
   if (!cachesize && !(cachesize = my_default_record_cache_size))
     DBUG_RETURN(1); /* No cache requested */
+
+  // 最小是 IO size 的两倍
+  // IO cache 太小，在做了 align 后容量就更小了，触发过多 IO 操作
   min_cache = use_async_io ? IO_SIZE * 4 : IO_SIZE * 2;
   if (type == READ_CACHE ||
       type == SEQ_READ_APPEND) { /* Assume file isn't growing */
@@ -233,6 +237,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   cache_myflags &= ~MY_DONT_CHECK_FILESIZE;
   if (type != READ_NET && type != WRITE_NET) {
     /* Retry allocating memory in smaller blocks until we get one */
+    // cache size 必须是 min_cache 的整数倍 
     cachesize = ((cachesize + min_cache - 1) & ~(min_cache - 1));
     for (;;) {
       size_t buffer_block;
@@ -242,11 +247,13 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
       */
       myf flags = (myf)(cache_myflags & ~(MY_WME | MY_WAIT_IF_FULL));
 
+      // cachesize 最小是 2 * IO_size
       if (cachesize < min_cache) cachesize = min_cache;
       buffer_block = cachesize;
       if (type == SEQ_READ_APPEND) buffer_block *= 2;
       if (cachesize == min_cache) flags |= (myf)MY_WME;
 
+      // 这里 cache 没有对齐
       if ((info->buffer = (uchar *)my_malloc(key_memory_IO_CACHE, buffer_block,
                                              flags)) != 0) {
         info->write_buffer = info->buffer;
@@ -278,12 +285,14 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   }
 #endif
 
+  // 为了对齐 IO
   if (type == WRITE_CACHE)
     info->write_end =
         info->buffer + info->buffer_length - (seek_offset & (IO_SIZE - 1));
   else
     info->read_end = info->buffer; /* Nothing in cache */
 
+  // end_of_file 跟 write cache 无关
   /* End_of_file may be changed by user later */
   info->end_of_file = end_of_file;
   info->error = 0;
@@ -1230,6 +1239,7 @@ int _my_b_get(IO_CACHE *info) {
    -1 On error; my_errno contains error code.
 */
 
+// 如果写入的 bytes 超过当前 IO Cache 的余量
 int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count) {
   size_t rest_length, length;
   my_off_t pos_in_file = info->pos_in_file;
@@ -1242,13 +1252,17 @@ int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count) {
     return info->error = -1;
   }
 
+  // 将开始的一部分先写入 IO cache
   rest_length = (size_t)(info->write_end - info->write_pos);
   memcpy(info->write_pos, Buffer, (size_t)rest_length);
   Buffer += rest_length;
   Count -= rest_length;
   info->write_pos += rest_length;
 
+  // 用 IO cache 先 flush 一次
   if (my_b_flush_io_cache(info, 1)) return 1;
+
+  // 剩余的部分直接写入文件
   if (Count >= IO_SIZE) { /* Fill first intern buffer */
     length = Count & (size_t) ~(IO_SIZE - 1);
     if (info->seek_not_done) {
@@ -1264,6 +1278,10 @@ int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count) {
       }
       info->seek_not_done = false;
     }
+
+    // 这里虽然是写入 4k 的倍数
+    // 但是 buffer 和 pfs block size 不对齐，还是要填充头尾
+    // 这里应该做 对齐
     if (mysql_file_write(info->file, Buffer, length, info->myflags | MY_NABP))
       return info->error = -1;
 
@@ -1284,6 +1302,7 @@ int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count) {
     Buffer += length;
     info->pos_in_file += length;
   }
+  // 剩余的部分还是先写到 IO Cache，等到之后再 flush
   memcpy(info->write_pos, Buffer, (size_t)Count);
   info->write_pos += Count;
   return 0;
@@ -1422,6 +1441,7 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
     }
     LOCK_APPEND_BUFFER;
 
+    // 当前 IO cache 里已经暂存的 bytes
     if ((length = (size_t)(info->write_pos - info->write_buffer))) {
       /*
         In case of a shared I/O cache with a writer we do direct write
@@ -1431,12 +1451,16 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
       */
       if (info->share) copy_to_read_buffer(info, info->write_buffer, length);
 
+      // 当前文件指针位置
       pos_in_file = info->pos_in_file;
+
       /*
         If we have append cache, we always open the file with
         O_APPEND which moves the pos to EOF automatically on every write
       */
+      // 如果不是使用 append 打开文件，每次需要自己 seek 文件指针
       if (!append_cache && info->seek_not_done) { /* File touched, do seek */
+        // 文件指针设置为 pos_in_file
         if (mysql_file_seek(info->file, pos_in_file, MY_SEEK_SET, MYF(0)) ==
             MY_FILEPOS_ERROR) {
           UNLOCK_APPEND_BUFFER;
@@ -1444,15 +1468,23 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
         }
         if (!append_cache) info->seek_not_done = false;
       }
+      // 记录已经写入的位置
       if (!append_cache) info->pos_in_file += length;
+
+      // 写完这一次之后，io cache 对齐 io size 后的大小
       info->write_end = (info->write_buffer + info->buffer_length -
                          ((pos_in_file + length) & (IO_SIZE - 1)));
 
+      // pos_in_file 开始写入 length 大小的 bytes
+      // io cache -> file
       if (mysql_file_write(info->file, info->write_buffer, length,
                            info->myflags | MY_NABP))
         info->error = -1;
       else
         info->error = 0;
+
+      // 更新文件末尾
+      // == info->pos_in_file
       if (!append_cache) {
         set_if_bigger(info->end_of_file, (pos_in_file + length));
       } else {
@@ -1460,7 +1492,11 @@ int my_b_flush_io_cache(IO_CACHE *info, int need_append_buffer_lock) {
         DBUG_ASSERT(info->end_of_file == mysql_file_tell(info->file, MYF(0)));
       }
 
+      // write_pos 指向 io_cache 的起始
+      // 相当于 清空 io cache
       info->append_read_pos = info->write_pos = info->write_buffer;
+
+      // 一共做了多少次 io cache -> file 操作
       ++info->disk_writes;
       UNLOCK_APPEND_BUFFER;
       DBUG_RETURN(info->error);

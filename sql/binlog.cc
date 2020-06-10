@@ -285,9 +285,12 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
     }
 #endif
 
+    // 新建一个 IO_CACHE_ostream 
     std::unique_ptr<IO_CACHE_ostream> file_ostream(new IO_CACHE_ostream);
+    // 打开 ostream 文件流
     if (file_ostream->open(log_file_key, binlog_name, flags)) DBUG_RETURN(true);
 
+    // 指针 cast
     m_pipeline_head = std::move(file_ostream);
 
     /* Setup encryption for new files if needed */
@@ -368,6 +371,8 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
   void close() {
     m_pipeline_head.reset(nullptr);
     m_position = 0;
+    // 这里需要把 file truncate
+    // 因为进行了补0
     m_encrypted_header_size = 0;
   }
 
@@ -383,7 +388,10 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
   bool write(const unsigned char *buffer, my_off_t length) override {
     DBUG_ASSERT(m_pipeline_head != NULL);
 
+    // 这个写到 io cache 
     if (m_pipeline_head->write(buffer, length)) return true;
+
+    // 这里可能 io cache 不够大
 
     m_position += length;
     return false;
@@ -422,7 +430,10 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
     return false;
   }
 
-  bool flush() { return m_pipeline_head->flush(); }
+  bool flush() { 
+    // 这里应该调用 direct_flush
+    return m_pipeline_head->flush(); 
+  }
   bool sync() { return m_pipeline_head->sync(); }
   bool flush_and_sync() { return flush() || sync(); }
   my_off_t position() { return m_position; }
@@ -466,6 +477,7 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
   void set_encrypted() { m_encrypted = true; }
 
  private:
+  // 建一个 align buffer，open 时候初始化，close 时候释放
   my_off_t m_position = 0;
   int m_encrypted_header_size = 0;
   std::unique_ptr<Truncatable_ostream> m_pipeline_head;
@@ -1078,9 +1090,8 @@ class binlog_cache_mngr {
     my_off_t stmt_bytes = 0;
     my_off_t trx_bytes = 0;
 
-    // 非事务型 event 不能包含 xid
-    //
     // cache 里面包含了多个 event，同属于一个待提交的事务
+    // 非事务型 event 不能包含 xid
     DBUG_ASSERT(stmt_cache.has_xid() == 0);
     int error = stmt_cache.flush(thd, &stmt_bytes, wrote_xid);
     if (error) return error;
@@ -1225,13 +1236,20 @@ static int binlog_dummy_recover(handlerton *, XA_recover_txn *, uint,
   - the length is incremented by the checksum size if checksums are enabled
 */
 class Binlog_event_writer : public Basic_ostream {
+  // 底层文件接口的包装，包含 IO cache 
   MYSQL_BIN_LOG::Binlog_ofile *m_binlog_file;
+  // 是否使用 checksum
   bool have_checksum;
   ha_checksum initial_checksum;
+  // 计算出的 checksum，写入到 event 最后
   ha_checksum checksum;
+  // 当前 binlog file 已经写到了哪里，包括当前 event 长度
   uint32 end_log_pos;
+  // v4 event structure
   uchar header[LOG_EVENT_HEADER_LEN];
+  // 当前已经进来的 header bytes
   my_off_t header_len = 0;
+  // 从 header 中读取，并表示当前还剩多少 event 没进来
   uint32 event_len = 0;
 
  public:
@@ -1254,19 +1272,23 @@ class Binlog_event_writer : public Basic_ostream {
   }
 
   void update_header() {
+    // 读取 header 中的 event_len 信息
     event_len = uint4korr(header + EVENT_LEN_OFFSET);
 
     // Increase end_log_pos
     end_log_pos += event_len;
 
     // Update event length if it has checksum
+    // checksum 添加到 event 最后
     if (have_checksum) {
       int4store(header + EVENT_LEN_OFFSET, event_len + BINLOG_CHECKSUM_LEN);
       end_log_pos += BINLOG_CHECKSUM_LEN;
     }
 
     // Store end_log_pos
+    // 将当前 binlog end pos 写到 event header 的 next_positon 字段
     int4store(header + LOG_POS_OFFSET, end_log_pos);
+
     // update the checksum
     if (have_checksum) checksum = my_checksum(checksum, header, header_len);
   }
@@ -1274,26 +1296,40 @@ class Binlog_event_writer : public Basic_ostream {
   bool write(const unsigned char *buffer, my_off_t length) {
     DBUG_ENTER("Binlog_event_writer::write");
 
+    // 进来是字节流的一部分，要自己判断
+
     while (length > 0) {
       /* Write event header into binlog */
+      // 当前还没写到 event data 部分
+      // 继续填充 event header
       if (event_len == 0) {
         /* data in the buf may be smaller than header size.*/
+        // 进来的 bytes 还是不够填充 header
         uint32 header_incr =
             std::min<uint32>(LOG_EVENT_HEADER_LEN - header_len, length);
 
+        // 已经填充的 header buf 继续追加 bytes
         memcpy(header + header_len, buffer, header_incr);
         header_len += header_incr;
         buffer += header_incr;
+
+        // 进来的 bytes 已经消耗了 header_incr
         length -= header_incr;
 
+        // 如果 event header 已经满了
+        // 提取 header 中的信息，并更新 header 中的信息 
         if (header_len == LOG_EVENT_HEADER_LEN) {
           update_header();
+
+          // 只有 header buf 满了才进行一次写入，否则暂存在 buf 中
           if (m_binlog_file->write(header, header_len)) DBUG_RETURN(true);
 
           event_len -= header_len;
           header_len = 0;
         }
       } else {
+        // 每一轮只写当前 event
+        // 因为，后一个 header 需要做 update 再写入
         my_off_t write_bytes = std::min<uint64>(length, event_len);
 
         if (m_binlog_file->write(buffer, write_bytes)) DBUG_RETURN(true);
@@ -1308,11 +1344,14 @@ class Binlog_event_writer : public Basic_ostream {
 
         // The whole event is copied, now add the checksum
         if (have_checksum && event_len == 0) {
+          // 32bit checksum
           uchar checksum_buf[BINLOG_CHECKSUM_LEN];
-
+          // int 不能直接 write，用一个 buffer 寄存
           int4store(checksum_buf, checksum);
           if (m_binlog_file->write(checksum_buf, BINLOG_CHECKSUM_LEN))
             DBUG_RETURN(true);
+
+          // 清空当前 event 的 checksum
           checksum = initial_checksum;
         }
       }
@@ -1465,7 +1504,8 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
   @retval false Success.
   @retval true Error.
 */
-// gtid 写入在 两个 binlog cache 之前
+// 事务在主库上执行并提交，此时会给事务分配一个 gtid，该值会被写入到 binlog 中
+// 在一个事务的所有 event 之前先写 gtid 
 bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
                                Binlog_event_writer *writer) {
   DBUG_ENTER("MYSQL_BIN_LOG::write_gtid");
@@ -1474,7 +1514,6 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     The GTID for the THD was assigned at
     assign_automatic_gtids_to_flush_group()
   */
-  // 事务在主库上执行并提交，此时会给事务分配一个 gtid，该值会被写入到 binlog 中
   DBUG_ASSERT(thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS ||
               thd->owned_gtid.sidno > 0);
 
@@ -1495,7 +1534,7 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     situation, hence the need to set it here.
   */
 
-  // 如果连个binlog cache 都非空，那一个要在另一个后面执行，用这个字段连接
+  // 如果两个 binlog cache 都非空，那一个要在另一个后面执行，用这个字段连接
   thd->get_transaction()->last_committed = SEQ_UNINIT;
 
   /*
@@ -1602,6 +1641,7 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
   /*
     Generate and write the Gtid_log_event.
   */
+  // 生成 gtid event, gtid 格式：source_id:transaction_id
   Gtid_log_event gtid_event(
       thd, cache_data->is_trx_cache(), last_committed, sequence_number,
       cache_data->may_have_sbr_stmts(), original_commit_timestamp,
@@ -1877,7 +1917,11 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
   DBUG_PRINT("debug", ("flags.finalized: %s", YESNO(flags.finalized)));
   int error = 0;
   if (flags.finalized) {
+
+    // binlog cache 的字节数
     my_off_t bytes_in_cache = m_cache.length();
+
+    // 获取要写入的这个事务, 一个线程对应一个事务
     Transaction_ctx *trn_ctx = thd->get_transaction();
 
     DBUG_PRINT("debug", ("bytes_in_cache: %llu", bytes_in_cache));
@@ -1896,6 +1940,9 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
     if (trn_ctx->last_committed == SEQ_UNINIT)
       trn_ctx->last_committed = trn_ctx->sequence_number - 1;
 
+    // gtid 开启时，只能有一个 cache 非空
+    // gtid 关闭时，两个 cache 都可以有内容，使用匿名 gtid 占位
+
     /*
       The GTID is written prior to flushing the statement cache, if
       the transaction has written to the statement cache; and prior to
@@ -1908,6 +1955,9 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
       non-empty then we get two Anonymous_gtid_log_events, which is
       correct.
     */
+    
+    // 每次将 binlog cache 写入到 io cache
+    // 先建立一个 binlog writer
     Binlog_event_writer writer(mysql_bin_log.get_binlog_file());
 
     /* The GTID ownership process might set the commit_error */
@@ -1924,7 +1974,8 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
       if ((error = mysql_bin_log.write_gtid(thd, this, &writer)))
         thd->commit_error = THD::CE_FLUSH_ERROR;
 
-    // 将binlog cache 文件写入binlog 文件
+    // 将binlog cache 文件拷贝 io cache
+    // 调用 binlog writer 处理进来的 字节流 
     if (!error) error = mysql_bin_log.write_cache(thd, this, &writer);
 
     if (flags.with_xid && error == 0) *wrote_xid = true;
@@ -3736,6 +3787,7 @@ bool MYSQL_BIN_LOG::open(PSI_file_key log_file_key, const char *log_name,
   */
   if (!is_relay_log) mysql_mutex_lock(&LOCK_sync);
 
+  // 打开 binlog 文件
   ret = m_binlog_file->open(log_file_key, log_file_name, flags);
 
   if (!is_relay_log) mysql_mutex_unlock(&LOCK_sync);
@@ -8591,6 +8643,7 @@ int MYSQL_BIN_LOG::flush_cache_to_file(my_off_t *end_pos_var) {
     thd->commit_error = THD::CE_FLUSH_ERROR;
     return ER_ERROR_ON_WRITE;
   }
+  // 不用在里面获取
   *end_pos_var = m_binlog_file->position();
   return 0;
 }
@@ -8984,6 +9037,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
       flush_error = ER_ERROR_ON_WRITE;
     }
 
+    // 更新 binlog end pos 并通知 dump 线程 
     if (!update_binlog_end_pos_after_sync) update_binlog_end_pos();
 
     DBUG_EXECUTE_IF("crash_commit_after_log", DBUG_SUICIDE(););
@@ -9020,6 +9074,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
                           thd->commit_error));
     DBUG_RETURN(finish_commit(thd));
   }
+
 
   /*
     Shall introduce a delay only if it is going to do sync
@@ -9079,6 +9134,8 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     my_off_t pos = 0;
     while (tmp_thd->next_to_commit != NULL) tmp_thd = tmp_thd->next_to_commit;
     if (flush_error == 0 && sync_error == 0) {
+      // 这里 binlog file 的 pos 已经被之后的 flush 线程更改了
+      // 所以找到 sync queue 的最后一个 thd 的 pos
       tmp_thd->get_trans_fixed_pos(&binlog_file, &pos);
       update_binlog_end_pos(binlog_file, pos);
     }

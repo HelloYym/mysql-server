@@ -1298,6 +1298,7 @@ static inline bool current_write_ahead_enough(const log_t &log, uint64_t offset,
   return (write_ahead_enough(log.write_ahead_end_offset, offset, size));
 }
 
+// 计算下一个 write ahead buf 的末尾 offset (file offset)
 static inline uint64_t compute_next_write_ahead_end(uint64_t real_offset) {
   const auto last_wa =
       ut_uint64_align_down(real_offset, srv_log_write_ahead_size);
@@ -1378,6 +1379,9 @@ static inline size_t compute_how_much_to_write(const log_t &log,
   Still we might decide not to write from the log buffer,
   because write-ahead is needed. In such case we could write
   together with the last incomplete block after copying. */
+
+  // 使用 wa buf 时候，才进行 last block 的头尾填充，并写入 512 对齐
+  // 不使用 wa buf 时，只考虑写 completed block，即 block size=512 对齐
   write_from_log_buffer = write_size >= OS_FILE_LOG_BLOCK_SIZE;
 
   if (write_from_log_buffer) {
@@ -1386,24 +1390,48 @@ static inline size_t compute_how_much_to_write(const log_t &log,
     MONITOR_INC(MONITOR_LOG_PARTIAL_BLOCK_WRITES);
   }
 
-  // 总结：什么情况才从wa写？
-  // 
-  // 情况2：到达新的wa起点，为了避免read-on-write
-  // 情况5：只写一个incomplete block填充头尾，为了尽快返回用户线程
+  // note：write ahead <> write ahead buffer
+  //  write ahead
+  //    文件的某个区间被 write ahead 后，对应的 page 就已经在 pagecache 中
+  //    后续对这个区间的写入，不管从哪都可以
+  //  write adead buffer
+  //    只是用来补0和暂存数据
   //
-  // 否则，直接从logbuf写入文件，避免额外的从logbuf到wa的copy
+  // 问题一: 什么情况需要拷贝到 write ahead buffer 再写？
+  // 
+  //    情况2：到达新的 wa 起点，为了补0
+  //    情况5：incomplete block 不能在 log buf 中填充头尾
+  //           所以借用 wa buf 填充头尾并写入，尽快返回用户线程
+  //
+  // 问题二：什么情况不需要考虑 read on write 问题？
+  //    
+  //    read on head 发生条件：(第一次写 page) && (write size < page size) 
+  //
+  //    情况1：如果 write size >= page size：直接覆盖整个 page，没有 read on write
+  //    情况3 4：如果不是第一次写 page：page 已经在 page cache 中, 无需读磁盘
 
   /* Check how much we have written ahead to avoid read-on-write. */
 
-  // write_ahead_end 是否大于 real_offset + write_size
+  // write_ahead_end 表示已经文件中已经填 0 的最后位置
+  // 判断当前写入内容的末尾 offset 是否还在补 0 范围内
   if (!current_write_ahead_enough(log, real_offset, write_size)) {
+
+    // --------超出 wa 区间---------
+    
     if (!current_write_ahead_enough(log, real_offset, 1)) {
       /* Current write-ahead region has no space at all. */
 
+      // --------新的 wa 区间-------需要对齐写，避免 read on write----
+      
+      // 当前的 write ahead 已经写完了
+      // 下一个 write ahead 的末尾对应的 file offset 
+      //
+      // real offset 可能不在 wa 起始
       const auto next_wa = compute_next_write_ahead_end(real_offset);
 
       if (!write_ahead_enough(next_wa, real_offset, write_size)) {
-        // 1. wa没有意义，直接就能避免read on write
+        // 1. write size > wa size，并且 real offset 也是 wa 起始
+        // wa 没有意义，直接就能避免 read on write
 
         /* ... and also the next write-ahead is too small.
         Therefore we have more data to write than size of
@@ -1411,7 +1439,8 @@ static inline size_t compute_how_much_to_write(const log_t &log,
         skipping last fragment for which the write ahead
         is required. */
 
-        // > write_ahead_size 代表 > block_size, then write from log buffer
+        // write size > wa size >= block size
+        // write_from_log_buffer 的条件是 write size >= block size
         ut_a(write_from_log_buffer);
 
         // 写满wa大小，但是不经过wa
@@ -1422,7 +1451,9 @@ static inline size_t compute_how_much_to_write(const log_t &log,
         ut_a(write_size % OS_FILE_LOG_BLOCK_SIZE == 0);
 
       } else {
-        // 2. wa开始，进行预写
+        // 2. wa开始，进行预写，补0
+        //
+        // 存在最后一个 incompleted block，与 5 一样
         
         /* We copy data to write_ahead buffer,
         and write from there doing write-ahead
@@ -1432,7 +1463,10 @@ static inline size_t compute_how_much_to_write(const log_t &log,
       }
 
     } else {
-      // 3. 只要有地方就先把wa写满，肯定是从logbuf写
+      // 3. 只要有地方就先把 wa 区间写满
+      //
+      // 这种情况肯定是从 log buf 写，即 write_size > block size
+      // 因为 real offset 对齐，而且 wa 有容量，但是装不下
 
       /* We limit write up to the end of region
       we have written ahead already. */
@@ -1440,26 +1474,32 @@ static inline size_t compute_how_much_to_write(const log_t &log,
       write_size =
           static_cast<size_t>(log.write_ahead_end_offset - real_offset);
 
-      // 这种情况肯定write_size比block大
-      // 因为real offset对齐，而且wa有容量，但是装不下
       ut_a(write_size >= OS_FILE_LOG_BLOCK_SIZE);
       ut_a(write_size % OS_FILE_LOG_BLOCK_SIZE == 0);
     }
 
   } else {
     if (write_from_log_buffer) {
-      // 4. 直接从logbuf写，避免一次copy，跟3这种情况是类似的
+      // 要写的 page 在补0的时候已经在 pagecache 里面了
+      // 问题：pagecache 时间长了是否会失效？
+      //
+      // 4. 直接从 logbuf 写，跟3这种情况是类似的，写区间已经被 write ahead 了
       // 
       // 为什么不把最后一个incomplete带着?
-      // 因为后面没走copy to wa这个函数，就不会填充block头尾
+      // 因为后面没走 copy to wa 这个函数，就不会填充block头尾
       write_size = ut_uint64_align_down(write_size, OS_FILE_LOG_BLOCK_SIZE);
     }
-    // 5. else, 小数据写入wa
+
+    // 小数据为什么不直接写 pagecache? 反正page都在pagecache里
+    // incompleted block 需要填写头尾信息
+    // 借用 wa buf 做这个事情
   }
 
   return (write_size);
 }
 
+// 在 log buffer 中填充将要写的 block 的头尾信息
+// 最后一个 incompleted block 先不写头尾信息
 static inline void prepare_full_blocks(const log_t &log, byte *buffer,
                                        size_t size, lsn_t start_lsn,
                                        checkpoint_no_t checkpoint_no) {
@@ -1578,6 +1618,8 @@ static inline void copy_to_write_ahead_buffer(log_t &log, const byte *buffer,
   // 最后一个block填零
   if (incomplete_size != 0) {
     /* Prepare the incomplete (last) block. */
+    
+    // 既然是 incompleted block，肯定是之前写入的
     ut_a(incomplete_size >= LOG_BLOCK_HDR_SIZE);
 
     log_block_set_hdr_no(
@@ -1599,6 +1641,7 @@ static inline void copy_to_write_ahead_buffer(log_t &log, const byte *buffer,
 
     log_block_store_checksum(incomplete_block);
 
+    // incompleted block 写整个 block
     size = completed_blocks_size + OS_FILE_LOG_BLOCK_SIZE;
   }
 
@@ -1636,6 +1679,8 @@ static inline size_t prepare_for_write_ahead(log_t &log, uint64_t real_offset,
 
   LOG_SYNC_POINT("log_writer_before_write_ahead");
 
+  // 如果 real offset 不在 wa 区间起始
+  // 那 wa start -- real offset 这一段要不要写入？
   std::memset(log.write_ahead_buf + write_size, 0x00, write_ahead);
 
   write_size += write_ahead;
@@ -1656,6 +1701,8 @@ static inline void update_current_write_ahead(log_t &log, uint64_t real_offset,
 
 }  // namespace Log_files_write_impl
 
+// log buffer -> log file pagecache
+// 要写入的范围已经计算好了
 static void log_files_write_buffer(log_t &log, byte *buffer, size_t buffer_size,
                                    lsn_t start_lsn) {
   ut_ad(log_writer_mutex_own(log));
@@ -1668,13 +1715,13 @@ static void log_files_write_buffer(log_t &log, byte *buffer, size_t buffer_size,
 
   checkpoint_no_t checkpoint_no = log.next_checkpoint_no.load();
 
-  // 写入文件的实际位置
+  // 写入文件的实际 offset，即从当前文件的 offset 位置开始写数据
   // start_lsn 一定落在当前文件中，不然上一次写入已经开新文件了
   const auto real_offset = compute_real_offset(log, start_lsn);
 
   bool write_from_log_buffer;
 
-  // 根据文件大小和wa buf大小计算写入大小
+  // 根据文件大小和 wa buf 大小计算写入大小
   auto write_size = compute_how_much_to_write(log, real_offset, buffer_size,
                                               write_from_log_buffer);
 
@@ -1683,12 +1730,17 @@ static void log_files_write_buffer(log_t &log, byte *buffer, size_t buffer_size,
     return;
   }
 
-  // 在log buffer中填写block的头尾信息
-  // 最后一个incomplete块的信息等下次写入时再更新
+  // 在 log buffer 中填写 block 的头尾信息，checkpoint、checksum 等信息
+  //
+  // 最后一个 incomplete 块的信息等下次写入时再更新
+  // 所以 start lsn 之前对齐了 log block，即更新上一个 incomplete 块的头尾
   prepare_full_blocks(log, buffer, write_size, start_lsn, checkpoint_no);
 
   byte *write_buf;
   uint64_t written_ahead = 0;
+
+  // 后面填充 incompleted block 时增加了 write_size 
+  // write_size 包括补0 的部分，因此这里保存 lsn 实际增加的部分
   lsn_t lsn_advance = write_size;
 
   if (write_from_log_buffer) {
@@ -1704,19 +1756,22 @@ static void log_files_write_buffer(log_t &log, byte *buffer, size_t buffer_size,
   } else {
 
     // write_ahead_buf 和 [lastwa, nextwa] 区间不是一个东西
-    // 区间是一个逻辑指针，表示这段磁盘已经被write ahead了
-    // buf 只是一个内存中的待写数据临时存放的位置，因为不能直接在logbuf中填零
+    // 区间是一个逻辑指针，表示这段磁盘已经被 write ahead 了
+    // buf 只是一个内存中的待写数据临时存放的位置，因为不能直接在 logbuf 中填零
 
     write_buf = log.write_ahead_buf;
 
     /* We write all the data directly from the write-ahead buffer,
     where we first need to copy the data. */
 
-    // 直接复制到write_ahead_buf的开头
-    // write_ahead_buf是不记录位置的，只负责暂存数据
+    // 直接复制到 write_ahead_buf 的开头
+    // write_ahead_buf 是不对应 offset 或 lsn 位置的，只负责暂存数据
+    //
+    // 填充了 last incompleted block，write_size 一定对齐 log block
     copy_to_write_ahead_buffer(log, buffer, write_size, start_lsn,
                                checkpoint_no);
 
+    // 对应情况2，补0
     if (!current_write_ahead_enough(log, real_offset, 1)) {
       // 每次write ahead开头
       // 计算要write_size + write_ahead_size
@@ -1736,6 +1791,8 @@ static void log_files_write_buffer(log_t &log, byte *buffer, size_t buffer_size,
 
   const lsn_t old_write_lsn = log.write_lsn.load();
 
+  // start_lsn 也是做了 align log block 的
+  // 而不是实际上新的 log 的开始位置
   const lsn_t new_write_lsn = start_lsn + lsn_advance;
   ut_a(new_write_lsn > log.write_lsn.load());
 
@@ -1921,15 +1978,21 @@ static void log_writer_wait_on_archiver(log_t &log, lsn_t last_write_lsn,
   }
 }
 
+// log_writer 线程每次调用这个函数
+// 主要负责：计算实际要写入的 buffer 范围和 lsn 范围
+//
+// 逻辑上可以写的数据：log buffer 中直到 next_write_lsn 的内容
+// 实际需要对这个范围进行裁剪
 static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
   ut_ad(log_writer_mutex_own(log));
 
   LOG_SYNC_POINT("log_writer_write_begin");
 
+  // 上一次已经写到的 lsn
   const lsn_t last_write_lsn = log.write_lsn.load();
 
   // lsn不能落在header和tailer里面
-  // % block_size==0 说明刚好写满一个block
+  // % block_size==0 说明上次刚好写满一个block
   ut_a(log_lsn_validate(last_write_lsn) ||
        last_write_lsn % OS_FILE_LOG_BLOCK_SIZE == 0);
 
@@ -1940,17 +2003,18 @@ static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
   ut_a(next_write_lsn - last_write_lsn <= log.buf_size);
   ut_a(next_write_lsn > last_write_lsn);
 
-  // 循环队列缓冲区，offset缓冲区内位置
-  // 0 <= offset <= buf_size
+  // log buffer 是循环使用的，offset 缓冲区内位置
+  // 0 <= offset < buf_size
   size_t start_offset = last_write_lsn % log.buf_size;
   size_t end_offset = next_write_lsn % log.buf_size;
 
   // 缓冲区末尾回绕
+  // 为了让写入的内容是连续的，这次就只写一半
   if (start_offset >= end_offset) {
     // 一样的条件，重复验证
     ut_a(next_write_lsn - last_write_lsn >= log.buf_size - start_offset);
 
-    // 前移next_lsn到缓冲区末尾
+    // 前移 next_lsn 到缓冲区末尾
     end_offset = log.buf_size;
     next_write_lsn = last_write_lsn + (end_offset - start_offset);
   }
@@ -1961,7 +2025,7 @@ static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
        end_offset % OS_FILE_LOG_BLOCK_SIZE >= LOG_BLOCK_HDR_SIZE);
 
   /* Wait until there is free space in log files.*/
-
+  // redo log file group 是循环使用的，checkpoint 之后才能重复
   const lsn_t checkpoint_limited_lsn =
       log_writer_wait_on_checkpoint(log, last_write_lsn, next_write_lsn);
 
@@ -1978,7 +2042,8 @@ static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
 
   LOG_SYNC_POINT("log_writer_after_archiver_check");
 
-  // 如果文件的空间不足，能写多少写多少
+  // 如果 log file group 空间不足，checkpoint 不够快
+  // 能写多少写多少
   const lsn_t limit_for_next_write_lsn = checkpoint_limited_lsn;
 
   if (limit_for_next_write_lsn < next_write_lsn) {
@@ -1996,12 +2061,16 @@ static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
   DBUG_PRINT("ib_log",
              ("write " LSN_PF " to " LSN_PF, last_write_lsn, next_write_lsn));
 
-  // 保证start对齐block size
+  // 写入的起始位置为什么要对齐 log block?
+  // 因为已经写入的 log block header 要更新
   byte *buf_begin =
       log.buf + ut_uint64_align_down(start_offset, OS_FILE_LOG_BLOCK_SIZE);
 
   // end 没有做对齐
   byte *buf_end = log.buf + end_offset;
+
+  // start lsn 同样是对齐了 log block
+  // 这样相当于将上次 write 的一部分重新写了一下
 
   /* Do the write to the log files */
   log_files_write_buffer(
@@ -2015,7 +2084,8 @@ static void log_writer_write_buffer(log_t &log, lsn_t next_write_lsn) {
   LOG_SYNC_POINT("log_writer_write_end");
 }
 
-// log buffer -> log files
+// log_writer 线程
+// 一直检查 log buffer，并写入 file pagecache
 void log_writer(log_t *log_ptr) {
   ut_a(log_ptr != nullptr);
   ut_a(log_ptr->writer_thread_alive.load());
@@ -2030,9 +2100,11 @@ void log_writer(log_t *log_ptr) {
 
   Log_write_to_file_requests_monitor write_to_file_requests_monitor{log};
 
+  // log_writer 线程一直运行，从 log buffer 把数据刷到 log file pagecache
   for (uint64_t step = 0;; ++step) {
     bool released = false;
 
+    // log_writer 线程每次唤醒，检查等待条件
     auto stop_condition = [&ready_lsn, &log, &released,
                            &write_to_file_requests_monitor](bool wait) {
 
@@ -2042,8 +2114,10 @@ void log_writer(log_t *log_ptr) {
       }
 
       /* Advance lsn up to which data is ready in log buffer. */
+      // 检查 recent written buffer 推进 log.buf_ready_for_write_lsn 
       (void)log_advance_ready_for_write_lsn(log);
 
+      // ready_lsn 表示 log buffer 中已经连续了，可以 write 的 lsn
       ready_lsn = log_buffer_ready_for_write_lsn(log);
 
       /* Wait until any of following conditions holds:
@@ -2051,12 +2125,14 @@ void log_writer(log_t *log_ptr) {
               2) We should close threads. */
 
       // 如果condition检查通过，直接返回true
+      // 1. 是否有数据可以 write
+      // 2. 是否需要 close 线程
       if (log.write_lsn.load() < ready_lsn || log.should_stop_threads.load()) {
         return (true);
       }
 
       // wait表示已经不在spin阶段了
-      // 释放锁
+      // 释放锁，进入 wait
       if (wait) {
         write_to_file_requests_monitor.update();
         log_writer_mutex_exit(log);
@@ -2072,6 +2148,8 @@ void log_writer(log_t *log_ptr) {
 
     /* Do the actual work. */
     if (log.write_lsn.load() < ready_lsn) {
+
+      // 做实际的写入工作
       log_writer_write_buffer(log, ready_lsn);
 
       // 为什么要释放一次锁

@@ -417,6 +417,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
   uint *sync_period_ptr;
   uint sync_counter;
 
+  // 所有 prepared 状态的事务
   mysql_cond_t m_prep_xids_cond;
   std::atomic<int32> m_atomic_prep_xids{0};
 
@@ -646,6 +647,7 @@ class MYSQL_BIN_LOG : public TC_LOG {
   /* The previous gtid set in relay log. */
   Gtid_set *previous_gtid_set_relaylog;
 
+  // init server 时，tc_log.open 直接进到这里，做内部 xa 恢复
   int open(const char *opt_name) { return open_binlog(opt_name); }
   bool change_stage(THD *thd, Stage_manager::StageID stage, THD *queue,
                     mysql_mutex_t *leave, mysql_mutex_t *enter);

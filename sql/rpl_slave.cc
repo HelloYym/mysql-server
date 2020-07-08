@@ -4069,6 +4069,7 @@ static ulong read_event(MYSQL *mysql, MYSQL_RPL *rpl, Master_info *mi,
     DBUG_RETURN(packet_error);
   }
 
+  // net.read_pos[4] 是什么
   DBUG_PRINT("exit", ("len: %lu  net->read_pos[4]: %d", rpl->size,
                       mysql->net.read_pos[4]));
   DBUG_RETURN(rpl->size - 1);

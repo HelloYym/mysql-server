@@ -3692,6 +3692,8 @@ end:
 int MYSQL_BIN_LOG::generate_new_name(char *new_name, const char *log_name,
                                      uint32 new_index_number) {
   fn_format(new_name, log_name, mysql_data_home, "", 4);
+  // 如果 log_name 没有指定 ext，例如 mysql-binlog.000005
+  // 就在 dir 中搜索下一个文件名，每个 binlog 文件用拓展名标识
   if (!fn_ext(log_name)[0]) {
     if (find_uniq_filename(new_name, new_index_number)) {
       if (current_thd != nullptr)
@@ -3736,6 +3738,8 @@ bool MYSQL_BIN_LOG::init_and_set_log_file_name(const char *log_name,
   // 如果给出了 new_name 就直接复制过去
   // my_stpcpy 返回值：pointer to terminating null byte
   if (new_name && !my_stpcpy(log_file_name, new_name))
+    // new_file_impl 时会进入这个函数，new_name 已经生成好了
+    // 因为要 new_file_impl 要事先获得 new_name 来写入到上一个 binlog 末尾
     return true;
   else if (!new_name &&
            generate_new_name(log_file_name, log_name, new_index_number))
@@ -4406,10 +4410,14 @@ bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
                                                    const char **errmsg) {
   DBUG_ENTER("MYSQL_BIN_LOG::gtid_read_start_binlog");
   LOG_INFO linfo;
+
+  // 所有 binlog 文件名 list
   auto log_index = this->get_log_index();
   std::list<std::string> filename_list = log_index.second;
   int error = log_index.first;
   list<string>::reverse_iterator rit;
+
+  // 默认是传进来的 gtid set?
   Gtid_set binlog_previous_gtid_set{gtid_set->get_sid_map()};
 
   if (error != LOG_INFO_EOF) {
@@ -5569,6 +5577,8 @@ int MYSQL_BIN_LOG::find_next_relay_log(char log_name[FN_REFLEN + 1]) {
   return error;
 }
 
+// 遍历当前 index 文件中的所有 logfilename
+// 返回一个列表
 std::pair<int, std::list<std::string>> MYSQL_BIN_LOG::get_log_index(
     bool need_lock_index) {
   DBUG_ENTER("MYSQL_BIN_LOG::get_log_index(bool)");
@@ -5954,6 +5964,7 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
     File name exists in index file; delete until we find this file
     or a file that is used.
   */
+  // 从第一个 binlog 开始删除
   if ((error = find_log_pos(&log_info, NullS, false /*need_lock_index=false*/)))
     goto err;
 
@@ -6338,7 +6349,10 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
   if ((error = find_log_pos(&log_info, NullS, false /*need_lock_index=false*/)))
     goto err;
 
+  // log_file_name 变量记录了当前 active 的 binlog filename
+  // 比较一下，index 读取的当前条目是否等于这个 active file
   while (!(log_is_active = is_active(log_info.log_file_name))) {
+    // 检查 binlog 文件状态
     if (!mysql_file_stat(m_key_file_log, log_info.log_file_name, &stat_area,
                          MYF(0))) {
       if (my_errno() == ENOENT) {
@@ -6371,6 +6385,8 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
        it in the list of binary log files to be purged.
     */
     else if (stat_area.st_mtime < purge_time) {
+      // 到达一个正在使用的文件，可能是 dump 线程在 read
+      // 停止继续查找
       if ((no_of_threads_locking_log = log_in_use(log_info.log_file_name))) {
         if (!auto_purge) {
           log_is_in_use = true;
@@ -6378,6 +6394,7 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
         }
         break;
       }
+      // 每次更新 to_log，即 purge 的最终位点
       strmake(to_log, log_info.log_file_name,
               sizeof(log_info.log_file_name) - 1);
       no_of_log_files_purged++;
@@ -6393,12 +6410,16 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
           ER_THD(thd, ER_WARN_PURGE_LOG_IS_ACTIVE), log_info.log_file_name);
   }
 
+  // 如果有文件超时需要 purge，但是 in_use，就输出 warning
   if (log_is_in_use) {
     int no_of_log_files_to_purge = no_of_log_files_purged + 1;
+    // 继续从 in_use 文件向后遍历
+    // strcmp 判断是否到达 active binlog file
     while (strcmp(log_file_name, log_info.log_file_name)) {
       if (mysql_file_stat(m_key_file_log, log_info.log_file_name, &stat_area,
                           MYF(0))) {
         if (stat_area.st_mtime < purge_time)
+          // in_use 文件后面的 timeout 的文件
           no_of_log_files_to_purge++;
         else
           break;
@@ -6416,6 +6437,9 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
                         no_of_log_files_to_purge);
   }
 
+  // 这里跟 purge_master_logs 函数的调用一样
+  // 都是先找到 to_log 的位点，然后调用 purge_logs 函数
+  // 注意：这里 include == true
   error = (to_log[0] ? purge_logs(to_log, true, false /*need_lock_index=false*/,
                                   true /*need_update_threads=true*/,
                                   (ulonglong *)0, auto_purge)
@@ -6537,8 +6561,13 @@ int MYSQL_BIN_LOG::new_file_impl(
     mysql_mutex_lock(&LOCK_log);
   else
     mysql_mutex_assert_owner(&LOCK_log);
+
+  // 持有 lock_log 并准备获取 lock_xids
   DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
                   DEBUG_SYNC(current_thd, "before_rotate_binlog"););
+
+  // 等待所有 prepared 状态的事务都完成提交
+  // 这个过程一直持有 lock_log 锁，阻止后续事务提交
   mysql_mutex_lock(&LOCK_xids);
   /*
     We need to ensure that the number of prepared XIDs are 0.
@@ -6555,6 +6584,8 @@ int MYSQL_BIN_LOG::new_file_impl(
 
   mysql_mutex_lock(&LOCK_index);
 
+  // 同时持有 lock_log 和 lock_index
+  // 完全锁住 binlog
   mysql_mutex_assert_owner(&LOCK_log);
   mysql_mutex_assert_owner(&LOCK_index);
 
@@ -6563,6 +6594,7 @@ int MYSQL_BIN_LOG::new_file_impl(
     goto end;
   }
 
+  // 把上一个 binlog 中所有已经执行的 gtid 放到 gtid table 中
   if (!is_relay_log) {
     /* Save set of GTIDs of the last binlog into table on binlog rotation */
     if ((error = gtid_state->save_gtids_of_last_binlog_into_table(true))) {
@@ -6627,6 +6659,7 @@ int MYSQL_BIN_LOG::new_file_impl(
       We log the whole file name for log file as the user may decide
       to change base names at some point.
     */
+    // 新建一个 rotate_log_event，记录新文件的 全名
     Rotate_log_event r(new_name + dirname_length(new_name), 0, LOG_EVENT_OFFSET,
                        is_relay_log ? Rotate_log_event::RELAY_LOG : 0);
 
@@ -6645,6 +6678,7 @@ int MYSQL_BIN_LOG::new_file_impl(
       goto end;
     }
 
+    // 关闭前做一次 flush 将 rotate event 刷到 iocache
     if ((error = m_binlog_file->flush())) {
       close_on_error = true;
       snprintf(close_on_error_msg, sizeof close_on_error_msg, "%s",
@@ -6653,10 +6687,14 @@ int MYSQL_BIN_LOG::new_file_impl(
     }
   }
 
+  // 已经写入 rotate event 到 binlog 末尾
   DEBUG_SYNC(current_thd, "after_rotate_event_appended");
 
+  // 关闭上一个旧的 binlog 文件
   old_name = name;
   name = 0;  // Don't free name
+
+  // 同时关闭了 binlog file 和 index file
   close(LOG_CLOSE_TO_BE_OPENED | LOG_CLOSE_INDEX, false /*need_lock_log=false*/,
         false /*need_lock_index=false*/);
 
@@ -6670,6 +6708,7 @@ int MYSQL_BIN_LOG::new_file_impl(
     (important for is_open()).
   */
 
+  // 关闭了上一个 binlog，准备打开下一个 binlog
   DEBUG_SYNC(current_thd, "binlog_rotate_between_close_and_open");
   /*
     new_file() is only used for rotation (in FLUSH LOGS or because size >
@@ -6680,12 +6719,15 @@ int MYSQL_BIN_LOG::new_file_impl(
     trigger temp tables deletion on slaves.
   */
 
+  // 每次 rotate 都先关闭 index 再打开 index，否则 seek 有问题
   /* reopen index binlog file, BUG#34582 */
   file_to_open = index_file_name;
+  // open index 时直接使用之前的 index_file_name，后面的 log_name 不需要
   error = open_index_file(index_file_name, 0, false /*need_lock_index=false*/);
   if (!error) {
     /* reopen the binary log file. */
     file_to_open = new_name_ptr;
+    // 打开一个新的 binlog 文件，并添加到 index 文件末尾
     error = open_binlog(old_name, new_name_ptr, max_size,
                         true /*null_created_arg=true*/,
                         false /*need_lock_index=false*/,
@@ -7694,9 +7736,11 @@ void MYSQL_BIN_LOG::close(
       to sync data to disk when another thread is closing m_binlog_file.
     */
     if (!is_relay_log) mysql_mutex_lock(&LOCK_sync);
+    // 关闭当前 active 的 binlog
     m_binlog_file->close();
     if (!is_relay_log) mysql_mutex_unlock(&LOCK_sync);
 
+    // to_be_opened 中间状态，rotate 时候马上就要打开下一个binlog
     atomic_log_state =
         (exiting & LOG_CLOSE_TO_BE_OPENED) ? LOG_TO_BE_OPENED : LOG_CLOSED;
     my_free(name);
@@ -7722,6 +7766,7 @@ void MYSQL_BIN_LOG::close(
 
   if (need_lock_index) mysql_mutex_unlock(&LOCK_index);
 
+  // 设置 mysql_bin_log 状态
   atomic_log_state =
       (exiting & LOG_CLOSE_TO_BE_OPENED) ? LOG_TO_BE_OPENED : LOG_CLOSED;
   my_free(name);
@@ -7771,6 +7816,9 @@ void MYSQL_BIN_LOG::set_max_size(ulong max_size_arg) {
 
 // 若打开binlog，且使用了事务引擎，则XA控制对象为mysql_bin_log
 // mysql_bin_log tc_log_mmap tc_log_dummy 都是 TC_LOG 的子类
+//
+// init_server_component 的 tc_log.open 直接进到这里
+// opt_name 是原始的 log-bin 参数的 value
 
 
 /**
@@ -8814,6 +8862,8 @@ static inline int call_after_sync_hook(THD *queue_head) {
                          by the thread (happens when we are handling flush
                          error)
 */
+// group commit 时候写入 binlog 出现问题
+// 根据 binlog_error_action 决定关闭 binlog 还是 shutdown server
 void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
                                                       bool need_lock_log) {
   char errmsg[MYSQL_ERRMSG_SIZE];

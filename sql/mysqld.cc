@@ -5082,7 +5082,8 @@ static int init_server_components() {
     // FN_REFLEN=512 是 mysql 允许的最大路径长度
     char buf[FN_REFLEN];
     const char *ln;
-    // log_bin 是否 enable
+
+    // 是否 有 log-bin 参数
     if (log_bin_supplied) {
       /*
         Binary log basename defaults to "`hostname`-bin" name prefix
@@ -5587,6 +5588,7 @@ static int init_server_components() {
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
+  // 读取最后一个 binlog，做xa
   if (tc_log->open(opt_bin_log ? opt_bin_logname : opt_tc_log_file)) {
     LogErr(ERROR_LEVEL, ER_CANT_INIT_TC_LOG);
     unireg_abort(MYSQLD_ABORT_EXIT);
@@ -8904,6 +8906,7 @@ bool mysqld_get_one_option(int optid,
       opt_myisam_log = 1;
       break;
     case (int)OPT_BIN_LOG:
+      // log-bin 参数时候有值
       opt_bin_log = (argument != disabled_my_option);
       if (!opt_bin_log) {
         // Clear the binlog basename used by any previous --log-bin
@@ -8912,6 +8915,7 @@ bool mysqld_get_one_option(int optid,
           opt_bin_logname = NULL;
         }
       }
+      // 如果进到这里，说明cnf中有这个参数，但是参数可能是空 或 不合法
       log_bin_supplied = true;
       break;
     case (int)OPT_REPLICATE_IGNORE_DB: {

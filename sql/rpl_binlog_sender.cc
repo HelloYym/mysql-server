@@ -362,9 +362,11 @@ void Binlog_sender::run() {
   DBUG_VOID_RETURN;
 }
 
+// 发送一个 binlog 文件中所有的 event
 int Binlog_sender::send_binlog(File_reader *reader, my_off_t start_pos) {
   if (unlikely(send_format_description_event(reader, start_pos))) return 1;
 
+  // 从头开始读 binlog file
   if (start_pos == BIN_LOG_HEADER_SIZE) start_pos = reader->position();
 
   if (m_check_previous_gtid_event) {

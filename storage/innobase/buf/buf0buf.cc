@@ -4765,6 +4765,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
   ut_ad(mtr->is_active());
   ut_ad(page_id.space() != 0 || !page_size.is_compressed());
 
+  // bp 中拿到一个空闲 block
   free_block = buf_LRU_get_free_block(buf_pool);
 
   mutex_enter(&buf_pool->LRU_list_mutex);
@@ -4798,8 +4799,12 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 
   block = free_block;
 
+  // block->mutex 和 block->lock 什么区别?
+  // mutex 是 latch, lock 是 lock？
+  // mutex 保护 block 的内存内容
   buf_page_mutex_enter(block);
 
+  // 把 page 放到 bp 的空闲 block 中
   buf_page_init(buf_pool, page_id, page_size, block);
 
   buf_block_buf_fix_inc(block, __FILE__, __LINE__);
@@ -4879,6 +4884,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 #ifdef UNIV_IBUF_COUNT_DEBUG
   ut_a(ibuf_count_get(block->page.id) == 0);
 #endif
+
   return (block);
 }
 

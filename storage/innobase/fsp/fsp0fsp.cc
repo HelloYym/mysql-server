@@ -546,9 +546,13 @@ UNIV_INLINE MY_ATTRIBUTE((warn_unused_result)) xdes_t
 #endif /* UNIV_DEBUG */
   ut_ad(mtr_memo_contains(mtr, &fspace->latch, MTR_MEMO_X_LOCK));
   ut_ad(mtr_memo_contains_page(mtr, sp_header, MTR_MEMO_PAGE_SX_FIX));
+  // fsp_hdr 在文件第一个 page 的 38 offset 位置
   ut_ad(page_offset(sp_header) == FSP_HEADER_OFFSET);
   /* Read free limit and space size */
+  // 一个 space 的 ibd 文件，后面一部分没有初始化，没有加入各种链表
+  // limit 表示最大的 page no
   limit = mach_read_from_4(sp_header + FSP_FREE_LIMIT);
+  // 当前 space 占有的页面数，跟 limit 什么区别?
   size = mach_read_from_4(sp_header + FSP_SIZE);
   flags = mach_read_from_4(sp_header + FSP_SPACE_FLAGS);
   ut_ad(limit == fspace->free_limit ||
@@ -591,6 +595,8 @@ UNIV_INLINE MY_ATTRIBUTE((warn_unused_result)) xdes_t
     *desc_block = block;
   }
 
+  // 这个函数的页面一定在 extent 0
+  // 还是说每个 group 的第一个 page 都有 FSP_HDR 空闲？
   return (descr_page + XDES_ARR_OFFSET +
           XDES_SIZE * xdes_calc_descriptor_index(page_size, offset));
 }
@@ -634,11 +640,14 @@ is x-locked.
 UNIV_INLINE
 xdes_t *xdes_lst_get_descriptor(space_id_t space, const page_size_t &page_size,
                                 fil_addr_t lst_node, mtr_t *mtr) {
+  // 通过 xdes 的 list node 获得 xdes 内存指针
   xdes_t *descr;
 
   ut_ad(mtr);
   ut_ad(mtr_memo_contains(mtr, fil_space_get_latch(space), MTR_MEMO_X_LOCK));
 
+  // list node 在 xdes entry 中的 8bits 位置
+  // 前面 8bits 是 segment id
   descr = fut_get_ptr(space, page_size, lst_node, RW_SX_LATCH, mtr) -
           XDES_FLST_NODE;
 
@@ -1392,6 +1401,7 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
   ut_d(fsp_space_modify_check(space->id, mtr));
 
   /* Check if we can fill free list from above the free list limit */
+  // space current size in page, include page above limit
   size = mach_read_from_4(header + FSP_SIZE);
   limit = mach_read_from_4(header + FSP_FREE_LIMIT);
   flags = mach_read_from_4(header + FSP_SPACE_FLAGS);
@@ -1405,6 +1415,9 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
 
   const page_size_t page_size(flags);
 
+  // 一次 add 4 个 extent 到 free list
+  // 如果未初始化的还不足 4 个 extent
+  // 扩大物理文件
   if (size < limit + FSP_EXTENT_SIZE * FSP_FREE_ADD) {
     if ((!init_space && !fsp_is_system_tablespace(space->id) &&
          !fsp_is_global_temporary(space->id)) ||
@@ -1417,13 +1430,22 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
     }
   }
 
+  // page no
   i = limit;
 
+  // while 循环每次扩充 1个 extent
+  // 总共扩充 FSP_FREE_ADD = 4 个 extent
   while ((init_space && i < 1) ||
          ((i + FSP_EXTENT_SIZE <= size) && (count < FSP_FREE_ADD))) {
+    // 是否是 group 的第一个 page
+    // group = 256 extent = 256 * 64 page = 2^14 page
+    // page size = 16KB = 2^14
+    // page no % (pages in group) == 0
     bool init_xdes = (ut_2pow_remainder(i, page_size.physical()) == 0);
 
+    // 推进 free limit 一个 extent = 64 pages
     space->free_limit = i + FSP_EXTENT_SIZE;
+    // 写进 fsp header page
     mlog_write_ulint(header + FSP_FREE_LIMIT, i + FSP_EXTENT_SIZE, MLOG_4BYTES,
                      mtr);
 
@@ -1435,8 +1457,10 @@ static void fsp_fill_free_list(bool init_space, fil_space_t *space,
       pages should be ignored. */
 
       if (i > 0) {
+        // XDES page
         const page_id_t page_id(space->id, i);
 
+        // lock the XDES page
         block = buf_page_create(page_id, page_size, RW_SX_LATCH, mtr);
 
         buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
@@ -1510,6 +1534,7 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
   xdes_t *descr;
   buf_block_t *desc_block = NULL;
 
+  // 直接 x lock 了 fsp header
   header = fsp_get_space_header(space_id, page_size, mtr);
 
   descr = xdes_get_descriptor_with_space_hdr(header, space_id, hint, mtr, false,
@@ -1524,8 +1549,11 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
 
   if (descr && (xdes_get_state(descr, mtr) == XDES_FREE)) {
     /* Ok, we can take this extent */
+    // hint 所在的这个 extent 是 FREE 状态，可以分配给 segment
   } else {
     /* Take the first extent in the free list */
+    // 无法分配 hint 所在的 extent
+    // 分配 free list 的第一个 extent
     first = flst_get_first(header + FSP_FREE, mtr);
 
     if (fil_addr_is_null(first)) {
@@ -1541,6 +1569,7 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
     descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
   }
 
+  // 将分配的 extent 对应的 xdes entry 从 free list 里删除
   flst_remove(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
   space->free_len--;
 
@@ -2184,6 +2213,7 @@ static ulint fseg_get_n_frag_pages(
 
   ut_ad(inode && mtr);
 
+  // 32 个零散页面，segment 先申请零散页面，再按整个 extent 分配
   for (i = 0; i < FSEG_FRAG_ARR_N_SLOTS; i++) {
     if (FIL_NULL != fseg_get_nth_frag_page_no(inode, i, mtr)) {
       count++;
@@ -2360,10 +2390,11 @@ static ulint fseg_n_reserved_pages_low(
   ut_ad(inode && used && mtr);
   ut_ad(mtr_memo_contains_page(mtr, inode, MTR_MEMO_PAGE_SX_FIX));
 
-  *used = mach_read_from_4(inode + FSEG_NOT_FULL_N_USED) +
-          FSP_EXTENT_SIZE * flst_get_len(inode + FSEG_FULL) +
-          fseg_get_n_frag_pages(inode, mtr);
+  *used = mach_read_from_4(inode + FSEG_NOT_FULL_N_USED) + // not full 中使用的 page
+          FSP_EXTENT_SIZE * flst_get_len(inode + FSEG_FULL) + // 64 * full 链表长度，即已经使用的 page
+          fseg_get_n_frag_pages(inode, mtr); // 分配给 segment 的 零散页面, 最多 32 个
 
+  // segment 已经获得的全部 page 个数
   ret = fseg_get_n_frag_pages(inode, mtr) +
         FSP_EXTENT_SIZE * flst_get_len(inode + FSEG_FREE) +
         FSP_EXTENT_SIZE * flst_get_len(inode + FSEG_NOT_FULL) +
@@ -2436,6 +2467,7 @@ static void fseg_fill_free_list(fseg_inode_t *inode, space_id_t space,
     return;
   }
 
+  // 分配 4 个连续的 extent 给 segment 的 free list
   for (i = 0; i < FSEG_FREE_LIST_MAX_LEN; i++) {
     descr = xdes_get_descriptor(space, hint, page_size, mtr);
 
@@ -2680,10 +2712,15 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
   ut_d(fsp_space_modify_check(space_id, mtr));
   ut_ad(fil_page_get_type(page_align(seg_inode)) == FIL_PAGE_INODE);
 
+  // reserved: 已经分配给 segment 的 page 数量
+  // used: 已经被 segment 使用的 page 数量
   reserved = fseg_n_reserved_pages_low(seg_inode, &used, mtr);
 
+  // fsp_hdr in space page 0 offset 38
   space_header = fsp_get_space_header(space_id, page_size, mtr);
 
+  // 不管怎么样，一个 page 的 xdes 一定能找到，而不用管 extent 状态
+  // 这个地方直接 lock 了这个 XDES page(extent0page0, extent1page0, extent2page0)
   descr = xdes_get_descriptor_with_space_hdr(space_header, space_id, hint, mtr);
   if (descr == NULL) {
     /* Hint outside space or too high above free limit: reset
@@ -2695,31 +2732,40 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
 
   /* In the big if-else below we look for ret_page and ret_descr */
   /*-------------------------------------------------------------*/
-  if (xdes_in_segment(descr, seg_id, mtr) &&
-      (xdes_mtr_get_bit(descr, XDES_FREE_BIT, hint % FSP_EXTENT_SIZE, mtr) ==
+  if (xdes_in_segment(descr, seg_id, mtr) && // 找到的 extent 已经在指定的 segment 里
+      (xdes_mtr_get_bit(descr, XDES_FREE_BIT, hint % FSP_EXTENT_SIZE, mtr) == // hint 这个 page 是空闲的
        TRUE)) {
   take_hinted_page:
     /* 1. We can take the hinted page
     =================================*/
+    // hint 对应的 extent 已经分配给 segment，并且 page 空闲
     ret_descr = descr;
     ret_page = hint;
     /* Skip the check for extending the tablespace. If the
     page hint were not within the size of the tablespace,
     we would have got (descr == NULL) above and reset the hint. */
+    // 1 和 2 两种情况都能成功分配 hint
+    // 1. 本来就在 segment 里
+    // 2. 新的 free extent 分配给 segment
+    // 即，got hinted page
     goto got_hinted_page;
     /*-----------------------------------------------------------*/
   } else if (xdes_get_state(descr, mtr) == XDES_FREE &&
-             reserved - used < reserved / FSEG_FILLFACTOR &&
-             used >= FSEG_FRAG_LIMIT) {
+             reserved - used < reserved / FSEG_FILLFACTOR && // reserved page 需要一直保持一定比例
+             used >= FSEG_FRAG_LIMIT) { // > 32 个 fragment array entry
     /* 2. We allocate the free extent from space and can take
     =========================================================
     the hinted page
     ===============*/
+    // hint 这个 page 在一个 free extent 里，并且 segment 的 page 也不太够了
+    // 就把这个 free extent 整体分配给这个 segment
     ret_descr = fsp_alloc_free_extent(space_id, page_size, hint, mtr);
 
     ut_a(ret_descr == descr);
 
+    // 将新分配的 extent 与 segment 关联
     xdes_set_segment_id(ret_descr, seg_id, XDES_FSEG, mtr);
+    // extent 的 xdes entry 加入 segment free list
     flst_add_last(seg_inode + FSEG_FREE, ret_descr + XDES_FLST_NODE, mtr);
 
     /* Try to fill the segment free list */
@@ -2738,11 +2784,16 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     ========================================================
     highest page in it, depending on the direction
     ==============================================*/
+    // hint 所在 extent 已经分配给其它 segment 了，或者 not full || full 状态
+    // 即，请求的 extent 不能分配给这个 segment
+    // 随便分配一个 extent 给 segment
     ret_page = xdes_get_offset(ret_descr);
 
     if (direction == FSP_DOWN) {
       ret_page += FSP_EXTENT_SIZE - 1;
     } else if (xdes_get_state(ret_descr, mtr) == XDES_FSEG_FRAG) {
+      // 这个 XDES_FSEG_FRAG 状态的 extent 是什么，为什么新分配的 extent 还不是 free 的
+      // 找到第一个 空闲的 page
       ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
     }
 
@@ -2756,6 +2807,8 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     ==================================================
     segment)
     ========*/
+    // hint 已经在 segment 里被使用了
+    // 同一个 extent 如果有空闲page 就分配
     ret_descr = descr;
     ret_page = xdes_get_offset(ret_descr) +
                xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE,
@@ -2909,10 +2962,14 @@ buf_block_t *fseg_alloc_free_page_general(
   buf_block_t *block;
   ulint n_reserved = 0;
 
+  // 从 page 的 fil_header(38bits) 中获取 space id
   space_id = page_get_space_id(page_align(seg_header));
 
+  // 获取 space 信息
   fil_space_t *space = fil_space_get(space_id);
 
+  // x lock space
+  // lock 时会记录代码位置
   mtr_x_lock_space(space, mtr);
 
   const page_size_t page_size(space->flags);
@@ -2926,6 +2983,7 @@ buf_block_t *fseg_alloc_free_page_general(
     }
   }
 
+  // 从 index page 中记录的 segment inode 位置获取 inode
   inode = fseg_inode_get(seg_header, space_id, page_size, mtr, &iblock);
   fil_block_check_type(iblock, FIL_PAGE_INODE, mtr);
 
@@ -3039,12 +3097,14 @@ bool fsp_reserve_free_extents(ulint *n_reserved, space_id_t space_id,
 
   fil_space_t *space = fil_space_get(space_id);
 
+  // 当前 space 可能有多个人调用
   mtr_x_lock_space(space, mtr);
 
   const page_size_t page_size(space->flags);
 
   space_header = fsp_get_space_header(space_id, page_size, mtr);
 try_again:
+  // 当前表空间占有的 page 数目
   size = mach_read_from_4(space_header + FSP_SIZE);
   ut_ad(size == space->size_in_header);
 
@@ -3055,9 +3115,11 @@ try_again:
         fsp_reserve_free_pages(space, space_header, size, mtr, n_pages));
   }
 
+  // space 的 free list 的长度，即 free extent 个数
   n_free_list_ext = flst_get_len(space_header + FSP_FREE);
   ut_ad(space->free_len == n_free_list_ext);
 
+  // space 文件这个页号之后的部分没有初始化
   free_limit = mtr_read_ulint(space_header + FSP_FREE_LIMIT, MLOG_4BYTES, mtr);
   ut_ad(space->free_limit == free_limit);
 
@@ -3066,6 +3128,7 @@ try_again:
   will not be free extents */
 
   if (size >= free_limit) {
+    // 这些 extent 是可以扩展出来的
     n_free_up = (size - free_limit) / FSP_EXTENT_SIZE;
   } else {
     ut_ad(alloc_type == FSP_BLOB);
@@ -3077,6 +3140,7 @@ try_again:
     n_free_up -= n_free_up / (page_size.physical() / FSP_EXTENT_SIZE);
   }
 
+  // 当前 space 文件中 总共 free 的 extent
   n_free = n_free_list_ext + n_free_up;
 
   switch (alloc_type) {
@@ -3111,6 +3175,7 @@ try_again:
     DBUG_RETURN(true);
   }
 try_to_extend:
+  // 把 space 文件后面未使用的 extent 加进来
   if (fsp_try_extend_data_file(space, space_header, mtr)) {
     goto try_again;
   }
@@ -3823,6 +3888,7 @@ std::ostream &fseg_header::to_stream(std::ostream &out) const {
 @return	true if extent is part of the segment, false otherwise */
 static bool xdes_in_segment(const xdes_t *descr, ib_id_t seg_id, mtr_t *mtr) {
   const xdes_state_t state = xdes_get_state(descr, mtr);
+  // 该 extent 的 state 必须是 XDES_FSEG，否则不属于某个 segment
   return ((state == XDES_FSEG || state == XDES_FSEG_FRAG) &&
           xdes_get_segment_id(descr, mtr) == seg_id);
 }

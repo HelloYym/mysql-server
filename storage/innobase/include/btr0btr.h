@@ -58,6 +58,7 @@ is acceptable for the program to die with a clear assert failure. */
 #define BTR_MAX_LEVELS 100
 
 /** Latching modes for btr_cur_search_to_nth_level(). */
+// latch mode 决定在 B-tree 查找时如何对路径加锁
 enum btr_latch_mode : size_t {
   /** Search a record on a leaf page and S-latch it. */
   BTR_SEARCH_LEAF = RW_S_LATCH,

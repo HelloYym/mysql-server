@@ -147,6 +147,7 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
       m_rel_pos == BTR_PCUR_BEFORE_FIRST_IN_TREE) {
     /* In these cases we do not try an optimistic restoration,
     but always do a search */
+    // 之前 page 是空的
 
     btr_cur_open_at_index_side(m_rel_pos == BTR_PCUR_BEFORE_FIRST_IN_TREE,
                                index, latch_mode, get_btr_cur(), 0, mtr);
@@ -174,6 +175,8 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
         btr_cur_optimistic_latch_leaves(m_block_when_stored, m_modify_clock,
                                         &latch_mode, &m_btr_cur, file, line,
                                         mtr)) {
+      // 如果乐观 restore 成功
+
       m_pos_state = BTR_PCUR_IS_POSITIONED;
 
       m_latch_mode = latch_mode;
@@ -217,6 +220,7 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
 
   auto heap = mem_heap_create(256);
 
+  // 根据保存的 m_old_rec 构建 search tuple
   tuple = dict_index_build_data_tuple(index, m_old_rec, m_old_n_fields, heap);
 
   /* Save the old search mode of the cursor */
@@ -227,15 +231,21 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
       mode = PAGE_CUR_LE;
       break;
     case BTR_PCUR_AFTER:
+      // store 时指向了 supremum 的前一个 rec
+      // 定位到大于 m_old_rec 的第一个 user record
       mode = PAGE_CUR_G;
       break;
     case BTR_PCUR_BEFORE:
+      // store 时指向了 infimum 的后一个 rec
+      // 定位到小于 m_old_rec 的第一个 user record
       mode = PAGE_CUR_L;
       break;
     default:
       ut_error;
   }
 
+  // 调用 search_to_nth_level 重新找到 old_rec
+  // 并且已经加好 latch 了
   open_no_init(index, tuple, mode, latch_mode, 0, mtr, file, line);
 
   /* Restore the old search mode */
@@ -333,6 +343,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   ut_ad(!is_before_first_in_tree(mtr));
 
   ulint latch_mode2;
+  // 当前 page 的 latch mode
   auto old_latch_mode = m_latch_mode;
 
   if (m_latch_mode == BTR_SEARCH_LEAF) {
@@ -345,8 +356,11 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
     ut_error;
   }
 
+  // 保存当前 page 的信息
   store_position(mtr);
 
+  // 释放当前 block 的 latch
+  // 因为要保证从左到右的加锁顺序
   mtr_commit(mtr);
 
   mtr_start(mtr);
@@ -391,6 +405,8 @@ bool btr_pcur_t::move_to_prev(mtr_t *mtr) {
 
   m_old_stored = false;
 
+  // 当前 cursor 在当前page 的 infimum rec 上
+  // 需要找前面一个 page
   if (is_before_first_on_page()) {
     if (is_before_first_in_tree(mtr)) {
       return (false);

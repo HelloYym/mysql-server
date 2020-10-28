@@ -412,8 +412,10 @@ static MY_ATTRIBUTE((warn_unused_result)) buf_block_t *btr_page_alloc_low(
   fseg_header_t *seg_header;
   page_t *root;
 
+  // index root page
   root = btr_root_get(index, mtr);
 
+  // leaf 和 internal 节点对应两个不同的 segment
   if (level == 0) {
     seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_LEAF;
   } else {
@@ -680,6 +682,7 @@ static ulint *btr_page_get_father_node_ptr_func(
   user_rec = btr_cur_get_rec(cursor);
   ut_a(page_rec_is_user_rec(user_rec));
 
+  // child node 里的 rec
   tuple = dict_index_build_node_ptr(index, user_rec, 0, heap, level);
   if (index->table->is_intrinsic()) {
     btr_cur_search_to_nth_level_with_no_latch(
@@ -694,6 +697,7 @@ static ulint *btr_page_get_father_node_ptr_func(
         rec_get_status(node_ptr) == REC_STATUS_NODE_PTR);
   offsets = rec_get_offsets(node_ptr, index, offsets, ULINT_UNDEFINED, &heap);
 
+  // 定位到 father 节点的 node_ptr 一定是指向当前 block 的
   if (btr_node_ptr_get_child_page_no(node_ptr, offsets) != page_no) {
     rec_t *print_rec;
 
@@ -755,8 +759,10 @@ static void btr_page_get_father(
                          its page x-latched */
 {
   mem_heap_t *heap;
+  // block 中的第一条 rec
   rec_t *rec =
       page_rec_get_next(page_get_infimum_rec(buf_block_get_frame(block)));
+  // 把 cursor 放到 current child block 上
   btr_cur_position(index, rec, block, cursor);
 
   heap = mem_heap_create(100);
@@ -1676,6 +1682,7 @@ ibool btr_page_get_split_rec_to_left(
   page = btr_cur_get_page(cursor);
   insert_point = btr_cur_get_rec(cursor);
 
+  // search insert_point 是按 LESS THAN
   if (page_header_get_ptr(page, PAGE_LAST_INSERT) ==
       page_rec_get_next(insert_point)) {
     infimum = page_get_infimum_rec(page);
@@ -1717,11 +1724,16 @@ ibool btr_page_get_split_rec_to_right(
   the previous insert on the same page, we assume that there is a
   pattern of sequential inserts here. */
 
+  // insert_point 是按 LESS THAN 方式找到的
+  // 因此 如果这个 insert_point == last_insert
+  // 说明连续的 向右顺序插入
   if (page_header_get_ptr(page, PAGE_LAST_INSERT) == insert_point) {
     rec_t *next_rec;
 
     next_rec = page_rec_get_next(insert_point);
 
+    // 如果已经到 page 的末尾了，就把新的 insert 当成 split rec
+    // 1. 之后 new page 中肯定可以继续顺序插入
     if (page_rec_is_supremum(next_rec)) {
     split_at_new:
       /* Split at the new record to insert */
@@ -1739,6 +1751,9 @@ ibool btr_page_get_split_rec_to_right(
       search position just by looking at the records on this
       page. */
 
+      // 如果在 page 中间，把 insert 之后的 rec 全都移到 new page
+      // 2. 那么 old page 肯定是以 insert rec 结尾的，那后面又空出了位置
+      //    可以继续顺序插入
       *split_rec = next_next_rec;
     }
 
@@ -2027,6 +2042,7 @@ static void btr_attach_half_pages(
   page_no_t prev_page_no;
   page_no_t next_page_no;
   ulint level;
+  // old block 的内存对象
   page_t *page = buf_block_get_frame(block);
   page_t *lower_page;
   page_t *upper_page;
@@ -2047,9 +2063,12 @@ static void btr_attach_half_pages(
 
   /* Based on split direction, decide upper and lower pages */
   if (direction == FSP_DOWN) {
+    // new block 在 block 的左侧
+    // split rec 应该成为 block 的 first rec
     btr_cur_t cursor;
     ulint *offsets;
 
+    // new block 放在左边
     lower_page = buf_block_get_frame(new_block);
     lower_page_no = new_block->page.id.page_no();
     lower_page_zip = buf_block_get_page_zip(new_block);
@@ -2058,19 +2077,27 @@ static void btr_attach_half_pages(
     upper_page_zip = buf_block_get_page_zip(block);
 
     /* Look up the index for the node pointer to page */
+    // 从上到下搜索一遍, BTR_CONT_MODIFY_TREE 的模式下不会对 index 及沿途路径加锁，
+    // 只在返回前对 child node 加 x latch
     offsets = btr_page_get_father_block(NULL, heap, index, block, mtr, &cursor);
 
     /* Replace the address of the old child node (= page) with the
     address of the new lower half */
 
+    // 把 father node 中指向 old block 的指针指向 new block
+    // 因为 new block 分裂到左边，first record 就是 old block 的 first record
+    // 所以直接替换 father node 中对应项的 node ptr
     btr_node_ptr_set_child_page_no(btr_cur_get_rec(&cursor),
                                    btr_cur_get_page_zip(&cursor), offsets,
                                    lower_page_no, mtr);
+    // 这样处理后，后面的逻辑都是 要往 father node 中插入 upper page
+
     mem_heap_empty(heap);
   } else {
     lower_page = buf_block_get_frame(block);
     lower_page_no = block->page.id.page_no();
     lower_page_zip = buf_block_get_page_zip(block);
+    // new page 放到右边
     upper_page = buf_block_get_frame(new_block);
     upper_page_no = new_block->page.id.page_no();
     upper_page_zip = buf_block_get_page_zip(new_block);
@@ -2084,33 +2111,41 @@ static void btr_attach_half_pages(
 
   /* for consistency, both blocks should be locked, before change */
   if (prev_page_no != FIL_NULL && direction == FSP_DOWN) {
+    // direction == DOWN 向左分裂时，才需要更新 prev node 的指针
     prev_block = btr_block_get(page_id_t(space, prev_page_no), block->page.size,
                                RW_X_LATCH, index, mtr);
   }
   if (next_page_no != FIL_NULL && direction != FSP_DOWN) {
+    // 向右分裂，修改 next node 的前向指针
     next_block = btr_block_get(page_id_t(space, next_page_no), block->page.size,
                                RW_X_LATCH, index, mtr);
   }
 
   /* Get the level of the split pages */
   level = btr_page_get_level(buf_block_get_frame(block), mtr);
+  // 分裂新建的 node 与 待分裂的 node 必须在一个 level
   ut_ad(level == btr_page_get_level(buf_block_get_frame(new_block), mtr));
 
   /* Build the node pointer (= node key and page address) for the upper
   half */
 
+  // 用之前计算得到的 split rec (first rec in upper page) 生成 node ptr
+  // (split_rec key, page no) 待插入 father node
+  // 这个 d_tuple 类型与插入数据是一样的
   node_ptr_upper =
       dict_index_build_node_ptr(index, split_rec, upper_page_no, heap, level);
 
   /* Insert it next to the pointer to the lower half. Note that this
   may generate recursion leading to a split on the higher level. */
 
+  // node ptr 插入到 father level
   btr_insert_on_non_leaf_level(flags, index, level + 1, node_ptr_upper, mtr);
 
   /* Free the memory heap */
   mem_heap_free(heap);
 
   /* Update page links of the level */
+  // 更新 前后节点 连接
 
   if (prev_block) {
 #ifdef UNIV_BTR_DEBUG
@@ -2192,10 +2227,13 @@ static rec_t *btr_insert_into_right_sibling(uint32_t flags, btr_cur_t *cursor,
                                             ulint **offsets, mem_heap_t *heap,
                                             const dtuple_t *tuple, ulint n_ext,
                                             mtr_t *mtr) {
+  // current page
   buf_block_t *block = btr_cur_get_block(cursor);
   page_t *page = buf_block_get_frame(block);
+  // next page
   page_no_t next_page_no = btr_page_get_next(page, mtr);
 
+  // modify 操作, index 肯定已经加 x latch
   ut_ad(cursor->index->table->is_intrinsic() ||
         mtr_memo_contains_flagged(mtr, dict_index_get_lock(cursor->index),
                                   MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK));
@@ -2203,6 +2241,7 @@ static rec_t *btr_insert_into_right_sibling(uint32_t flags, btr_cur_t *cursor,
       mtr_is_block_fix(mtr, block, MTR_MEMO_PAGE_X_FIX, cursor->index->table));
   ut_ad(heap);
 
+  // 必须是插入 page 最后, 并且 right page 存在
   if (next_page_no == FIL_NULL ||
       !page_rec_is_supremum(page_rec_get_next(btr_cur_get_rec(cursor)))) {
     return (NULL);
@@ -2217,14 +2256,17 @@ static rec_t *btr_insert_into_right_sibling(uint32_t flags, btr_cur_t *cursor,
 
   const space_id_t space = block->page.id.space();
 
+  // next block lock 住了
   next_block = btr_block_get(page_id_t(space, next_page_no), block->page.size,
                              RW_X_LATCH, cursor->index, mtr);
   next_page = buf_block_get_frame(next_block);
 
   bool is_leaf = page_is_leaf(next_page);
 
+  // 这里对 next block 的 father 加 x lock
   btr_page_get_father(cursor->index, next_block, mtr, &next_father_cursor);
 
+  // tuple 插入 next block 的位置
   page_cur_search(next_block, cursor->index, tuple, PAGE_CUR_LE,
                   &next_page_cursor);
 
@@ -2235,6 +2277,7 @@ static rec_t *btr_insert_into_right_sibling(uint32_t flags, btr_cur_t *cursor,
     lock_update_split_left(next_block, block);
   }
 
+  // 插入到 next page
   rec = page_cur_tuple_insert(&next_page_cursor, tuple, cursor->index, offsets,
                               &heap, n_ext, mtr);
 
@@ -2257,20 +2300,25 @@ static rec_t *btr_insert_into_right_sibling(uint32_t flags, btr_cur_t *cursor,
   /* adjust cursor position */
   *btr_cur_get_page_cur(cursor) = next_page_cursor;
 
+  // 插入的 rec 应该在 next page 的第一个
   ut_ad(btr_cur_get_rec(cursor) == page_get_infimum_rec(next_page));
   ut_ad(page_rec_get_next(page_get_infimum_rec(next_page)) == rec);
 
   /* We have to change the parent node pointer */
 
+  // 删除 father node 中指向 next page 的 node_ptr
+  // 如果这个 node_ptr 是 father node 的第一个 node_ptr, 会导致继续向上删除
   compressed = btr_cur_pessimistic_delete(&err, TRUE, &next_father_cursor,
                                           BTR_CREATE_FLAG, false, 0, 0, 0, mtr);
 
   ut_a(err == DB_SUCCESS);
 
+  // 删除 node_ptr 之后要压缩 father page
   if (!compressed) {
     btr_cur_compress_if_useful(&next_father_cursor, FALSE, mtr);
   }
 
+  // 新的 rec 插入 father node
   dtuple_t *node_ptr = dict_index_build_node_ptr(
       cursor->index, rec, next_block->page.id.page_no(), heap, level);
 
@@ -2371,6 +2419,9 @@ func_start:
   ut_ad(!page_is_empty(page));
 
   /* try to insert to the next page if possible before split */
+  // 这里可能修改 sibling 节点的 father
+  // 但是这种情况已经加了 current node 和 sibling node 的最近公共祖先的 latch
+  // 这里会加 sibling father 的 latch 吗
   rec = btr_insert_into_right_sibling(flags, cursor, offsets, *heap, tuple,
                                       n_ext, mtr);
 
@@ -2383,6 +2434,7 @@ func_start:
   /* 1. Decide the split record; split_rec == NULL means that the
   tuple to be inserted should be the first record on the upper
   half-page */
+  // split == NULL 表示 new rec 在 new page 的第一个
   insert_left = FALSE;
 
   if (n_iterations > 0) {
@@ -2395,12 +2447,18 @@ func_start:
           btr_page_tuple_smaller(cursor, tuple, offsets, n_uniq, heap);
     }
   } else if (btr_page_get_split_rec_to_right(cursor, &split_rec)) {
+    // 顺序向右插入，确定一个 split rec
+    // 两种划分方法，目的都是 split 后可以继续顺序插入
     direction = FSP_UP;
+    // 意向的page，尽量使 space 中的 page 连续
     hint_page_no = page_no + 1;
 
   } else if (btr_page_get_split_rec_to_left(cursor, &split_rec)) {
+    // 顺序向左分裂，新建的 new_page 放在左边
     direction = FSP_DOWN;
+    // 意向的 page
     hint_page_no = page_no - 1;
+    // 向左分裂，new rec 不可能在 upper half page first
     ut_ad(split_rec);
   } else {
     direction = FSP_UP;
@@ -2411,7 +2469,10 @@ func_start:
     to determine whether the new record will be inserted
     to the left or right. */
 
+    // 只有一条记录的 page 满了，说明 rec 很大
     if (page_get_n_recs(page) > 1) {
+      // 50-50 分配 old page 里的 rec
+      // insert 不一定在哪
       split_rec = page_get_middle_rec(page);
     } else if (btr_page_tuple_smaller(cursor, tuple, offsets, n_uniq, heap)) {
       split_rec = page_rec_get_next(page_get_infimum_rec(page));
@@ -2421,11 +2482,13 @@ func_start:
   }
 
   /* 2. Allocate a new page to the index */
+  // 从 index 的 segment 中分配一个 free block
   new_block = btr_page_alloc(cursor->index, hint_page_no, direction,
                              btr_page_get_level(page, mtr), mtr, mtr);
 
   new_page = buf_block_get_frame(new_block);
   new_page_zip = buf_block_get_page_zip(new_block);
+  // 以 index_page 格式初始化 new_block
   btr_page_create(new_block, new_page_zip, cursor->index,
                   btr_page_get_level(page, mtr), mtr);
 
@@ -2439,6 +2502,9 @@ func_start:
     *offsets =
         rec_get_offsets(split_rec, cursor->index, *offsets, n_uniq, heap);
 
+    // new rec 是否插入 left page
+    // split_rec 是 step 1 中计算得到的 upper page 的第一个 rec
+    // 如果 new rec < split_rec 就说明要插入 lower page
     insert_left = cmp_dtuple_rec(tuple, split_rec, cursor->index, *offsets) < 0;
 
     if (!insert_left && new_page_zip && n_iterations > 0) {
@@ -2459,6 +2525,7 @@ func_start:
     buf = UT_NEW_ARRAY_NOKEY(
         byte, rec_get_converted_size(cursor->index, tuple, n_ext));
 
+    // next page first rec 就是新插入的 tuple rec
     first_rec = rec_convert_dtuple_to_rec(buf, cursor->index, tuple, n_ext);
     move_limit = page_rec_get_next(btr_cur_get_rec(cursor));
   }
@@ -2472,6 +2539,9 @@ func_start:
   on the appropriate half-page, we may release the tree x-latch.
   We can then move the records after releasing the tree latch,
   thus reducing the tree latch contention. */
+  // 如果分裂后 tuple 能正常插入，就可以释放 index latch 了
+  // 之后再进行 rec 移动
+  // 前提是 leaf level
 
   if (split_rec) {
     insert_will_fit =
@@ -2496,6 +2566,7 @@ func_start:
 
     /* NOTE: We cannot release root block latch here, because it
     has segment header and already modified in most of cases.*/
+    // 什么时候 lock 的 root block latch
   }
 
   /* 5. Move then the records to the new page */

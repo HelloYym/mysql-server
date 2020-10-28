@@ -302,6 +302,9 @@ void flst_remove(
   ut_ad(mtr_memo_contains_page_flagged(
       mtr, node2, MTR_MEMO_PAGE_X_FIX | MTR_MEMO_PAGE_SX_FIX));
 
+  // node2 是链表节点内存位置，下面读取这个位置信息，解析到 node2_addr 中
+  // node2_addr 是 (XDES page , page offset)
+  // space + node_addr 完全标示一个 list node 位置
   buf_ptr_get_fsp_addr(node2, &space, &node2_addr);
 
   bool found;
@@ -309,6 +312,7 @@ void flst_remove(
 
   ut_ad(found);
 
+  // 这里所有 node 都是 xdes page 中的 xdes entry 的 list node
   node1_addr = flst_get_prev_addr(node2, mtr);
   node3_addr = flst_get_next_addr(node2, mtr);
 
@@ -316,13 +320,16 @@ void flst_remove(
     /* Update next field of node1 */
 
     if (node1_addr.page == node2_addr.page) {
+      // 如果两个node 在同一个 page 中，就可以根据 offset 直接获得 node1
       node1 = page_align(node2) + node1_addr.boffset;
     } else {
+      // 需要 x lock 上一个 node 所在的 page
       node1 = fut_get_ptr(space, page_size, node1_addr, RW_SX_LATCH, mtr);
     }
 
     ut_ad(node1 != node2);
 
+    // 连接 node1 -> node3
     flst_write_addr(node1 + FLST_NEXT, node3_addr, mtr);
   } else {
     /* node2 was first in list: update first field in base */
@@ -346,6 +353,7 @@ void flst_remove(
     flst_write_addr(base + FLST_LAST, node1_addr, mtr);
   }
 
+  // base node 在 fsp_hdr 里面，space page 0
   /* Update len of base node */
   len = flst_get_len(base);
   ut_ad(len > 0);

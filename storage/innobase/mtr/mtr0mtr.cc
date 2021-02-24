@@ -176,6 +176,7 @@ static void memo_slot_release(mtr_memo_slot_t *slot) {
     buf_block_t *block;
 #endif /* !UNIV_HOTBACKUP */
 
+    // buffer pool 中的 block 进行了修改
     case MTR_MEMO_BUF_FIX:
     case MTR_MEMO_PAGE_S_FIX:
     case MTR_MEMO_PAGE_SX_FIX:
@@ -188,6 +189,7 @@ static void memo_slot_release(mtr_memo_slot_t *slot) {
 #endif /* !UNIV_HOTBACKUP */
       break;
 
+    // 下面的 type 不涉及 block, 例如 space->latch 等
     case MTR_MEMO_S_LOCK:
       rw_lock_s_unlock(reinterpret_cast<rw_lock_t *>(slot->object));
       break;
@@ -258,6 +260,7 @@ struct Add_dirty_blocks_to_flush_list {
   /** @return true always. */
   bool operator()(mtr_memo_slot_t *slot) const {
     if (slot->object != NULL) {
+      // 只有 x lock 的block 才会被加到 flush list 上
       if (slot->type == MTR_MEMO_PAGE_X_FIX ||
           slot->type == MTR_MEMO_PAGE_SX_FIX) {
         add_dirty_page_to_flush_list(slot);
@@ -618,6 +621,7 @@ void mtr_t::Command::add_dirty_blocks_to_flush_list(lsn_t start_lsn,
 
   Iterate<Add_dirty_blocks_to_flush_list> iterator(add_to_flush);
 
+  // 当前 buf_page_get_gen 的每个 page
   m_impl->m_memo.for_each_block_in_reverse(iterator);
 }
 
@@ -629,6 +633,7 @@ void mtr_t::Command::execute() {
   ulint len;
 
 #ifndef UNIV_HOTBACKUP
+  // 要写的 redolog 的长度
   len = prepare_write();
 
   if (len > 0) {
@@ -641,15 +646,18 @@ void mtr_t::Command::execute() {
     write_log.m_handle = handle;
     write_log.m_lsn = handle.start_lsn;
 
+    // 把 mtr 中每个 redolog 写入全局 redolog buffer
     m_impl->m_log.for_each_block(write_log);
 
     ut_ad(write_log.m_left_to_write == 0);
     ut_ad(write_log.m_lsn == handle.end_lsn);
 
+    // 等 recent closed 空间
     log_wait_for_space_in_log_recent_closed(*log_sys, handle.start_lsn);
 
     DEBUG_SYNC_C("mtr_redo_before_add_dirty_blocks");
 
+    // 把 mtr 修改过的 block 加到 flush list 上面
     add_dirty_blocks_to_flush_list(handle.start_lsn, handle.end_lsn);
 
     log_buffer_close(*log_sys, handle);

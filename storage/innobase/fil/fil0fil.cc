@@ -6844,6 +6844,8 @@ bool fil_space_reserve_free_extents(space_id_t space_id, ulint n_free_now,
 
   bool success;
 
+  // 所谓 reserve 指的就是 记录目前 free extent 里有多少被 reserve 了
+  // 因此别的人不能用这部分空间
   if (space->n_reserved_extents + n_to_reserve > n_free_now) {
     success = false;
   } else {

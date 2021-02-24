@@ -455,6 +455,7 @@ buf_block_t *btr_page_alloc(
     return (btr_page_alloc_for_ibuf(index, mtr));
   }
 
+  // new_block 只关联 init_mtr, 其它 block 关联 mtr
   new_block = btr_page_alloc_low(index, hint_page_no, file_direction, level,
                                  mtr, init_mtr);
 
@@ -544,6 +545,7 @@ void btr_page_free_low(
   /* The page gets invalid for optimistic searches: increment the frame
   modify clock */
 
+  // 更新 modify clock, pcur restore 时候就无法乐观恢复
   buf_block_modify_clock_inc(block);
 
   if (dict_index_is_ibuf(index)) {
@@ -552,8 +554,10 @@ void btr_page_free_low(
     return;
   }
 
+  // 直接 SX 锁住根节点, 这样其它线程无法访问 seg list
   root = btr_root_get(index, mtr);
 
+  // 两个 segment header 存在 root 节点里
   if (level == 0 || level == ULINT_UNDEFINED) {
     seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_LEAF;
   } else {
@@ -860,6 +864,7 @@ ulint btr_create(ulint type, space_id_t space, const page_size_t &page_size,
   (for an ibuf tree, not in the root, but on a separate ibuf header
   page) */
 
+  // 索引类型如果是 ibuf
   if (type & DICT_IBUF) {
     /* Allocate first the ibuf header page */
     buf_block_t *ibuf_hdr_block =
@@ -880,6 +885,7 @@ ulint btr_create(ulint type, space_id_t space, const page_size_t &page_size,
                                  IBUF_TREE_ROOT_PAGE_NO, FSP_UP, mtr);
     ut_ad(block->page.id.page_no() == IBUF_TREE_ROOT_PAGE_NO);
   } else {
+    // 建立一个 non-leaf segment, 并分配一个 root page, 其中包括了 segment header
     block = fseg_create(space, 0, PAGE_HEADER + PAGE_BTR_SEG_TOP, mtr);
   }
 
@@ -902,6 +908,7 @@ ulint btr_create(ulint type, space_id_t space, const page_size_t &page_size,
     pages */
     buf_block_dbg_add_level(block, SYNC_TREE_NODE_NEW);
 
+    // 建立一个 leaf segment, 并将 segment header 写入前面建立的 root page
     if (!fseg_create(space, page_no, PAGE_HEADER + PAGE_BTR_SEG_LEAF, mtr)) {
       /* Not enough space for new segment, free root
       segment before return. */
@@ -933,6 +940,7 @@ ulint btr_create(ulint type, space_id_t space, const page_size_t &page_size,
   if (page_zip) {
     page = page_create_zip(block, index, 0, 0, mtr, page_create_type);
   } else {
+    // 把新分配的 root block 格式化为 index page
     page = page_create(block, mtr, dict_table_is_comp(index->table),
                        page_create_type);
     /* Set the level of the new index page */
@@ -943,6 +951,7 @@ ulint btr_create(ulint type, space_id_t space, const page_size_t &page_size,
   btr_page_set_index_id(page, page_zip, index_id, mtr);
 
   /* Set the next node and previous node fields */
+  // root page 没有左右节点
   btr_page_set_next(page, page_zip, FIL_NULL, mtr);
   btr_page_set_prev(page, page_zip, FIL_NULL, mtr);
 
@@ -2076,6 +2085,9 @@ static void btr_attach_half_pages(
     upper_page_no = block->page.id.page_no();
     upper_page_zip = buf_block_get_page_zip(block);
 
+    // insert tuple 不可能是 new_block 的 first rec
+    // 因为 search block 时使用 LESS mode, block 里肯定有比 tuple 小的 rec
+
     /* Look up the index for the node pointer to page */
     // 从上到下搜索一遍, BTR_CONT_MODIFY_TREE 的模式下不会对 index 及沿途路径加锁，
     // 只在返回前对 child node 加 x latch
@@ -2111,7 +2123,7 @@ static void btr_attach_half_pages(
 
   /* for consistency, both blocks should be locked, before change */
   if (prev_page_no != FIL_NULL && direction == FSP_DOWN) {
-    // direction == DOWN 向左分裂时，才需要更新 prev node 的指针
+    // direction == DOWN 时，才需要更新 prev node 的指针
     prev_block = btr_block_get(page_id_t(space, prev_page_no), block->page.size,
                                RW_X_LATCH, index, mtr);
   }
@@ -2526,7 +2538,9 @@ func_start:
         byte, rec_get_converted_size(cursor->index, tuple, n_ext));
 
     // next page first rec 就是新插入的 tuple rec
+    // 这是一个临时的 buf
     first_rec = rec_convert_dtuple_to_rec(buf, cursor->index, tuple, n_ext);
+    // cursor 处于要 insert 的位置
     move_limit = page_rec_get_next(btr_cur_get_rec(cursor));
   }
 
@@ -2539,9 +2553,9 @@ func_start:
   on the appropriate half-page, we may release the tree x-latch.
   We can then move the records after releasing the tree latch,
   thus reducing the tree latch contention. */
-  // 如果分裂后 tuple 能正常插入，就可以释放 index latch 了
-  // 之后再进行 rec 移动
-  // 前提是 leaf level
+
+  // leaf 之上的递归smo操作都已经完成了, 相当于只对 leaf page 修改的乐观插入
+  // 这时可以把 index sx lock 释放掉了, 只保留 leaf x lock
 
   if (split_rec) {
     insert_will_fit =
@@ -2566,7 +2580,6 @@ func_start:
 
     /* NOTE: We cannot release root block latch here, because it
     has segment header and already modified in most of cases.*/
-    // 什么时候 lock 的 root block latch
   }
 
   /* 5. Move then the records to the new page */
@@ -3114,6 +3127,7 @@ ibool btr_compress(
     ut_ad(mtr_memo_contains_flagged(mtr, dict_index_get_lock(index),
                                     MTR_MEMO_X_LOCK));
   } else {
+    // index x lock 什么时候加的
     ut_ad(mtr_memo_contains_flagged(mtr, dict_index_get_lock(index),
                                     MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK) ||
           index->table->is_intrinsic());
@@ -3385,6 +3399,12 @@ retry:
 #endif /* UNIV_BTR_DEBUG */
 
     /* Remove the page from the level list */
+    // 这里占着 current page 去锁 left page 为什么不会死锁?
+    // 1. 如果是 level 0, 那么 left node 已经被锁住了
+    // 2. 如果中间 level, 那么应该不会有从左到右 search 的场景? 只有从左到右 modify 场景(index lock)
+    //
+    // note: 同样是 level 0, BTR_SEARCH_PREV 模式因为一直从右到左走到底,
+    // 不能保证 left page 已经锁住, 因此需要 pcur restore
     btr_level_list_remove(space, page_size, page, index, mtr);
 
     ut_ad(btr_node_ptr_get_child_page_no(btr_cur_get_rec(&father_cursor),

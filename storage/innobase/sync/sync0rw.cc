@@ -501,18 +501,25 @@ ibool rw_lock_x_lock_low(
     ulint line)            /*!< in: line where requested */
 {
   if (rw_lock_lock_word_decr(lock, X_LOCK_DECR, X_LOCK_HALF_DECR)) {
+    // lock_word > HALF_DECR 表示没有其它 x lock 或 sx lock
     /* lock->recursive also tells us if the writer_thread
     field is stale or active. As we are going to write
     our own thread id in that field it must be that the
     current writer_thread value is not active. */
     ut_a(!lock->recursive);
 
+    // set recursive = true
     /* Decrement occurred: we are writer or next-writer. */
     rw_lock_set_writer_id_and_recursion_flag(lock, !pass);
 
+    // 如何判断 s lock?
+    // 已经减去了 X_LOCK_DECR, 但是之前可能有 S lock
+    // 等 S lock 全部释放, 即等待 lock_word >= 0
     rw_lock_x_lock_wait(lock, pass, 0, file_name, line);
 
   } else {
+    // 尝试递归加锁
+
     os_thread_id_t thread_id = os_thread_get_curr_id();
 
     if (!pass) {
@@ -523,23 +530,32 @@ ibool rw_lock_x_lock_low(
     this thread or another. Try to relock. */
     if (!pass && lock->recursive &&
         os_thread_eq(lock->writer_thread, thread_id)) {
+
+      // 当前线程之前加过 X 或 SX lock
+
       /* Other s-locks can be allowed. If it is request x
       recursively while holding sx lock, this x lock should
       be along with the latching-order. */
 
       /* The existing X or SX lock is from this thread */
       if (rw_lock_lock_word_decr(lock, X_LOCK_DECR, 0)) {
+        // 当前 lock_word > 0 表示肯定是 SX lock
+
         /* There is at least one SX-lock from this
         thread, but no X-lock. */
 
         /* Wait for any the other S-locks to be
         released. */
+        // 此时 current thread 加了一个 SX 又加了当前的 X
+        // lock_word 应该是 -X_LOCK_HALF_DECR
         rw_lock_x_lock_wait(lock, pass, -X_LOCK_HALF_DECR, file_name, line);
 
       } else {
         /* At least one X lock by this thread already
         exists. Add another. */
         if (lock->lock_word == 0 || lock->lock_word == -X_LOCK_HALF_DECR) {
+          // 一个 X lock 或者
+          // 一个 X lock + 一个 SX lock
           lock->lock_word -= X_LOCK_DECR;
         } else {
           ut_ad(lock->lock_word <= -X_LOCK_DECR);
@@ -548,6 +564,7 @@ ibool rw_lock_x_lock_low(
       }
 
     } else {
+      // 其它线程加过 X 或者 SX
       /* Another thread locked before us */
       return (FALSE);
     }
@@ -570,6 +587,7 @@ ibool rw_lock_sx_lock_low(
     const char *file_name, /*!< in: file name where lock requested */
     ulint line)            /*!< in: line where requested */
 {
+    // current thread 加 SX lock 不需要等其它线程的 S lock
   if (rw_lock_lock_word_decr(lock, X_LOCK_HALF_DECR, X_LOCK_HALF_DECR)) {
     /* lock->recursive also tells us if the writer_thread
     field is stale or active. As we are going to write

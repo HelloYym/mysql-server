@@ -3425,6 +3425,9 @@ dberr_t Buf_fetch_normal::get(buf_block_t *&block) {
     /* Lookup the page in the page hash. If it doesn't exist in the
     buffer pool then try and read it in from disk. */
 
+    // 如果 page hash 中已经有这个 buf_block_t, 说明 page 正在或已经被 read
+    // 这里会检查 io_fix, 如果是 BUF_IO_READ 就等待其它线程读完, buf_wait_for_read
+    // 即, 通过 io_fix 保持多线程互斥
     block = lookup();
 
     if (block != nullptr) {
@@ -3435,6 +3438,7 @@ dberr_t Buf_fetch_normal::get(buf_block_t *&block) {
       break;
     }
 
+    // bp 中没有找到这个 page, 当前线程负责 read
     /* Page not in buf_pool: needs to be read from file */
     read_page();
   }
@@ -4139,6 +4143,7 @@ buf_block_t *buf_page_get_gen(const page_id_t &page_id,
 #endif /* UNIV_DEBUG */
 
   if (mode == Page_fetch::NORMAL && !fsp_is_system_temporary(page_id.space())) {
+    // normal 模式 get 一个 page, 如果不在 bp 就从磁盘读
     Buf_fetch_normal fetch(page_id, page_size);
 
     fetch.m_rw_latch = rw_latch;
@@ -4559,6 +4564,7 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
   rw_lock_t *hash_lock;
   mtr_t mtr;
   void *data = NULL;
+  // 拿到一个 bp instance
   buf_pool_t *buf_pool = buf_pool_get(page_id);
 
   ut_ad(buf_pool);
@@ -4584,6 +4590,8 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
   if (page_size.is_compressed() && !unzip && !recv_recovery_is_on()) {
     block = NULL;
   } else {
+    // 拿一个空闲 buf_block_t
+    // 如果 free list 没有空 block, 就从 LRU list 淘汰一个
     block = buf_LRU_get_free_block(buf_pool);
     ut_ad(block);
     ut_ad(buf_pool_from_block(block) == buf_pool);
@@ -4598,8 +4606,10 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
     data = buf_buddy_alloc(buf_pool, page_size.physical());
   }
 
+  // 拿 LRU mutex
   mutex_enter(&buf_pool->LRU_list_mutex);
 
+  // 拿 hash_lock, 对应一个 hash slot
   hash_lock = buf_page_hash_lock_get(buf_pool, page_id);
 
   rw_lock_x_lock(hash_lock);
@@ -4616,6 +4626,7 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
 
     rw_lock_x_unlock(hash_lock);
 
+    // 把初始化的结构体还回去
     if (bpage != NULL) {
       buf_page_free_descriptor(bpage);
     }
@@ -4641,6 +4652,7 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
 
     buf_page_mutex_enter(block);
 
+    // 初始化 buf_block_t 类型是 BUF_BLOCK_FILE_PAGE, 加入 page hash
     buf_page_init(buf_pool, page_id, page_size, block);
 
     /* Note: We are using the hash_lock for protection. This is
@@ -4650,6 +4662,7 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
     buf_page_set_io_fix(bpage, BUF_IO_READ);
 
     /* The block must be put to the LRU list, to the old blocks */
+    // 加入 LRU list
     buf_LRU_add_block(bpage, TRUE /* to old blocks */);
 
     if (page_size.is_compressed()) {
@@ -4675,6 +4688,10 @@ buf_page_t *buf_page_init_for_read(dberr_t *err, ulint mode,
     read is completed.  The x-lock is cleared by the
     io-handler thread. */
 
+    // 当前线程等 IO 线程去 read, 等待方式是 wait 在 block->lock
+    // 其他 reader 可以通过 尝试获得 S-lock 来等待此次 IO 完成
+
+    // 第二个参数 pass, 如果 != 0, lock 就不支持递归, 并且会传给其它线程来释放
     rw_lock_x_lock_gen(&block->lock, BUF_IO_READ);
 
     rw_lock_x_unlock(hash_lock);

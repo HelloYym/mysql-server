@@ -286,6 +286,7 @@ btr_latch_leaves_t btr_cur_latch_leaves(buf_block_t *block,
 
     case BTR_SEARCH_PREV:
     case BTR_MODIFY_PREV:
+      // 走到这里, 说明前面一路都加了 两个page, 因此当前 level 两个page 不可能发生 smo
       mode = latch_mode == BTR_SEARCH_PREV ? RW_S_LATCH : RW_X_LATCH;
       /* latch also left sibling */
       rw_lock_s_lock(&block->lock);
@@ -339,24 +340,30 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
   switch (*latch_mode) {
     case BTR_SEARCH_LEAF:
     case BTR_MODIFY_LEAF:
+      // 会检查 current block 的 modify clock
       return (buf_page_optimistic_get(*latch_mode, block, modify_clock,
                                       cursor->m_fetch_mode, file, line, mtr));
     case BTR_SEARCH_PREV:
     case BTR_MODIFY_PREV:
       mode = *latch_mode == BTR_SEARCH_PREV ? RW_S_LATCH : RW_X_LATCH;
 
+      // 下面这一坨检查 current block 的代码跟 optimistic_get 里差不多
+
+      // 问题: block 的 mutex 和 sx lock 什么区别?
       buf_page_mutex_enter(block);
       if (buf_block_get_state(block) != BUF_BLOCK_FILE_PAGE) {
         buf_page_mutex_exit(block);
         return (false);
       }
       /* pin the block not to be relocated */
+      // 这里 pin block 是指什么? block 在内存的位置吗
       buf_block_buf_fix_inc(block, file, line);
       buf_page_mutex_exit(block);
 
+      // lock 当前 block, 检查 block 是否被修改过
       rw_lock_s_lock(&block->lock);
-      // 如果当前 page 的 modify clock 发生变化，则乐观策略失败
-      // 说明在放开 current page latch 之后，有人又改过了这个 page
+      // 如果当前 block 的 modify clock 发生变化，则乐观策略失败
+      // 说明在 store position 放开 current block 之后，有人又改过了这个 block
       if (block->modify_clock != modify_clock) {
         rw_lock_s_unlock(&block->lock);
 
@@ -364,13 +371,19 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
       }
       // 拿到前一个 page no
       left_page_no = btr_page_get_prev(buf_block_get_frame(block), mtr);
+
+      // 释放 current block, 准备去加 prev block
       rw_lock_s_unlock(&block->lock);
 
+      // 中间状态!!!
+      // 这个地方 left block 和 current block 都没有上锁
+      // 很可能发生 smo
+
+      // 拿到 left block, 已经 latch
       if (left_page_no != FIL_NULL) {
         const page_id_t page_id(dict_index_get_space(cursor->index),
                                 left_page_no);
 
-        // 在 buffer pool 中查找 left node，并加 latch
         cursor->left_block =
             btr_block_get(page_id, dict_table_page_size(cursor->index->table),
                           mode, cursor->index, mtr);
@@ -378,10 +391,14 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
         cursor->left_block = NULL;
       }
 
-      // latch 当前 block，并且再一次检查 modify clock
+      // latch 当前 block
+      //
+      // 这里会检查上面 中间状态时 两个block 是否发生过 smo
+      // 有两种情况:
+      // 1. current block 发生 smo, modify clock 变化了
+      // 2. left block 发生 smo, current block 的 prev 指针变了, 因此获取的 left page 不对了
       if (buf_page_optimistic_get(mode, block, modify_clock,
                                   cursor->m_fetch_mode, file, line, mtr)) {
-        // 再一次检查当前 page 的 left page，是否还是相连的
         if (btr_page_get_prev(buf_block_get_frame(block), mtr) ==
             left_page_no) {
           /* adjust buf_fix_count */
@@ -390,6 +407,7 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
           buf_page_mutex_exit(block);
 
           *latch_mode = mode;
+          // 成功了
           return (true);
         } else {
           /* release the block */
@@ -422,6 +440,7 @@ at the latch_mode.
 static btr_intention_t btr_cur_get_and_clear_intention(ulint *latch_mode) {
   btr_intention_t intention;
 
+  // 例如, btr_cur_pessimistic_delete 之前的 search nth level 时传进来 BTR_LATCH_FOR_DELETE
   switch (*latch_mode & (BTR_LATCH_FOR_INSERT | BTR_LATCH_FOR_DELETE)) {
     case BTR_LATCH_FOR_INSERT:
       intention = BTR_INTENTION_INSERT;
@@ -584,9 +603,12 @@ static bool btr_cur_need_opposite_intention(const page_t *page,
     case BTR_INTENTION_DELETE:
       return ((mach_read_from_4(page + FIL_PAGE_PREV) != FIL_NULL &&
                page_rec_is_first(rec, page)) ||
+      // delete 最后一个 rec 有什么影响?
+      // 子节点做了 right merge?
               (mach_read_from_4(page + FIL_PAGE_NEXT) != FIL_NULL &&
                page_rec_is_last(rec, page)));
     case BTR_INTENTION_INSERT:
+      // insert 最后一个可能触发 insert to right sibling
       return (mach_read_from_4(page + FIL_PAGE_NEXT) != FIL_NULL &&
               page_rec_is_last(rec, page));
     case BTR_INTENTION_BOTH:
@@ -656,7 +678,8 @@ void btr_cur_search_to_nth_level(
   btr_op_t btr_op;
   ulint root_height = 0; /* remove warning */
 
-  // upper_rw_latch 何时记录?
+  // upper_rw_latch 是什么意思?
+  // 中间 level 加什么锁
   ulint upper_rw_latch, root_leaf_rw_latch;
   // 当前遍历对 btree 的潜在影响
   btr_intention_t lock_intention;
@@ -862,6 +885,7 @@ void btr_cur_search_to_nth_level(
       // continue modify tree 时, 一定是之前已经 search 过了, index lock 还没释放
       // 例如 1. 获得 sibling node 的 father node(btr_insert_into_right_sibling)
       //      2. new block 的 node ptr 插入 father node
+      //      3. btr_compress 删除 node_ptr
       /* Do nothing */
       ut_ad(srv_read_only_mode ||
             mtr_memo_contains_flagged(mtr, dict_index_get_lock(index),
@@ -894,15 +918,14 @@ void btr_cur_search_to_nth_level(
           /* BTR_MODIFY_EXTERNAL needs to be excluded */
           mtr_sx_lock(dict_index_get_lock(index), mtr);
         }
+        // PREV 走到这里
         upper_rw_latch = RW_S_LATCH;
       } else {
         upper_rw_latch = RW_NO_LATCH;
       }
   }
 
-  // root page 应该与 index latch 类型一样，但是 page 上有没有 sx latch??
-  // 如果是不会修改 btree 的 search 就给这个 root page s lock 否则是x lock
-  // 如果 no latch 就不用加锁了
+  // btree 只有 root 节点时, 各种 mode 需要对 root 加什么锁
   root_leaf_rw_latch = btr_cur_latch_for_root_leaf(latch_mode);
 
   // page cursor 指向具体的 page
@@ -965,7 +988,7 @@ search_loop:
   rtree_parent_modified = false;
 
   // 这里根据规则先计算出当前节点的 latch mode
-  // modify tree 始终是 no latch
+  // BTR_MODIFY_TREE 始终是 no latch
   if (height != 0) {
     // 非叶子节点
     /* We are about to fetch the root or a non-leaf page. */
@@ -984,15 +1007,16 @@ search_loop:
         // 这个 btree 的 seg 信息存在 root page 里
         rw_latch = RW_SX_LATCH;
       } else {
-        // 与上面加锁模式一致
-        // 例如 BTR_CONT_MODIFY_TREE 使用 no_latch
+        // 非叶子节点使用什么锁, 每种 mode 不同
         rw_latch = upper_rw_latch;
       }
     }
   } else if (latch_mode <= BTR_MODIFY_LEAF) {
     // 叶子节点
     // search leaf 和 modify leaf 会走到这里
-    // 叶子结点的其它操作不加锁吗
+    //
+    // 叶子结点的其它操作不加锁吗?
+    // 在后面 btr_cur_latch_leaves 里统一加
     rw_latch = latch_mode;
 
     if (btr_op != BTR_NO_OP &&
@@ -1010,14 +1034,15 @@ retry_page_get:
   // 每个 level 只会访问一个 block
   ut_ad(n_blocks < BTR_MAX_LEVELS);
 
-  // 当前遍历到的 node 记录下来
+  // 当前 memo 栈的 size, 先记录 savepoint 再 get page 加锁
   tree_savepoints[n_blocks] = mtr_set_savepoint(mtr);
 
   // get block 并 latch
-  // modify tree 操作 no latch
+  // BTR_MODIFY_TREE 操作 no latch
   block = buf_page_get_gen(page_id, page_size, rw_latch, guess, fetch, file,
                            line, mtr);
-  // 记录遍历到的 block
+
+  // 当前遍历到的 node 记录下来
   tree_blocks[n_blocks] = block;
 
   // TODO 这个地方是 ibuf 操作
@@ -1087,7 +1112,8 @@ retry_page_get:
     goto retry_page_get;
   }
 
-  // TODO 这个标志哪里设置的？
+  // BTR_SEARCH_PREV/BTR_MODIFY_PREV 需要 latch left page
+  // 此时 parent 被 lock 了吗
   if (retrying_for_search_prev && height != 0) {
     /* also latch left sibling */
     page_no_t left_page_no;
@@ -1097,6 +1123,7 @@ retry_page_get:
 
     rw_latch = upper_rw_latch;
 
+    // current block 加的是 NO_LATCH, 得加个 s lock 再拿 left page no
     rw_lock_s_lock(&block->lock);
     left_page_no = btr_page_get_prev(buf_block_get_frame(block), mtr);
     rw_lock_s_unlock(&block->lock);
@@ -1128,7 +1155,10 @@ retry_page_get:
 
   page = buf_block_get_frame(block);
 
-  // TODO 这个地方为什么需要重新获取 root page
+  // eg: BTR_MODIFY_LEAF
+  // root_leaf_rw_latch = RW_X_LATCH
+  // rw_latch = upper_rw_latch = RW_S_LATCH
+  // 需要重新加一遍 block
   if (height == ULINT_UNDEFINED && page_is_leaf(page) &&
       rw_latch != RW_NO_LATCH && rw_latch != root_leaf_rw_latch) {
     /* We should retry to get the page, because the root page
@@ -1206,11 +1236,11 @@ retry_page_get:
       // 返回的 latch_leaves 包括左中右三个节点的 latch 状态
       //
       // 1. modify tree 对三个 leaf node 加 x latch
-      // 2. search/modify leaf 只对一个 leaf node 加对应的 latch
-      // 3. search/modify prev 对 prev 和 current node 加 latch
+      // 2. search/modify prev 对 prev 和 current node 加 latch
       latch_leaves = btr_cur_latch_leaves(block, page_id, page_size, latch_mode,
                                           cursor, mtr);
     }
+    // search/modify leaf 在 block_get 时已经加锁
 
     switch (latch_mode) {
       case BTR_MODIFY_TREE:
@@ -1233,6 +1263,7 @@ retry_page_get:
 
         /* release upper blocks */
         if (retrying_for_search_prev) {
+          // 释放沿途的 left page
           for (; prev_n_releases < prev_n_blocks; prev_n_releases++) {
             mtr_release_block_at_savepoint(
                 mtr, prev_tree_savepoints[prev_n_releases],
@@ -1401,7 +1432,7 @@ retry_page_get:
     pessimistic delete intention, it might cause node_ptr insert
     for the upper level. We should change the intention and retry.
     */
-    // delete 过程中可能需要辅助的 insert 操作
+    // delete 操作如果 rec 是 page 中的第一个或最后一个, 就会导致向上 delete 和 insert
     // 因此 intention 变为 BOTH
     // 需要从 root 重新 search 一遍
     if (latch_mode == BTR_MODIFY_TREE &&
@@ -1567,7 +1598,7 @@ retry_page_get:
       }
     }
 
-    // 如果 child 就到了指定 level 了
+    // 如果 child 就到了指定 level 了(height 已经 -- 了)
     if (height == level && latch_mode == BTR_MODIFY_TREE) {
       ut_ad(upper_rw_latch == RW_X_LATCH);
       /* we should sx-latch root page, if released already.
@@ -1596,15 +1627,19 @@ retry_page_get:
       ut_ad(mtr_memo_contains_flagged(
           mtr, block, MTR_MEMO_PAGE_S_FIX | MTR_MEMO_PAGE_X_FIX));
 
+      // 每到一层, 都检查下层 node_ptr 是否是当前 page 的 first rec
+      // 最终记录的是从下往上连续 first rec 的最上 level
       if (btr_page_get_prev(page, mtr) != FIL_NULL &&
           page_rec_is_first(node_ptr, page)) {
         if (leftmost_from_level == 0) {
+          // height + 1 才是 current level, 因为之前 -1 了
           leftmost_from_level = height + 1;
         }
       } else {
         leftmost_from_level = 0;
       }
 
+      // 到了 level0 就要开始 retry 了, 同时加 left page
       if (height == 0 && leftmost_from_level > 0) {
         /* should retry to get also prev_page
         from level==leftmost_from_level. */
@@ -1621,6 +1656,7 @@ retry_page_get:
 
         page_id.reset(space, tree_blocks[idx]->page.id.page_no());
 
+        // 先把之前的路径 release 掉, 再重试
         for (ulint i = n_blocks - (leftmost_from_level - 1); i <= n_blocks;
              i++) {
           mtr_release_block_at_savepoint(mtr, tree_savepoints[i],
@@ -3133,6 +3169,7 @@ dberr_t btr_cur_pessimistic_insert(
     of the index tree, so that the insert will not fail because
     of lack of space */
 
+    // 尝试预留 (tree_height / 16 + 3) 个 Extent
     ulint n_extents = cursor->tree_height / 16 + 3;
 
     success = fsp_reserve_free_extents(&n_reserved, index->space, n_extents,
@@ -4688,6 +4725,7 @@ ibool btr_cur_compress_if_useful(
     }
   }
 
+  // 先判断是否需要 compress
   return (btr_cur_compress_recommendation(cursor, mtr) &&
           btr_compress(cursor, adjust, mtr));
 }
@@ -4852,6 +4890,8 @@ ibool btr_cur_pessimistic_delete(
         index->table->is_intrinsic());
   ut_ad(mtr_is_block_fix(mtr, block, MTR_MEMO_PAGE_X_FIX, index->table));
 
+  // delete 时为什么还要 reserve, 因为可能向上更新 node_ptr?
+  // 但是更新 node_ptr 时 insert 时会做 reserve 呀？
   if (!has_reserved_extents) {
     /* First reserve enough free space for the file segments
     of the index tree, so that the node pointer updates will
@@ -4904,6 +4944,9 @@ ibool btr_cur_pessimistic_delete(
 
   level = btr_page_get_level(page, mtr);
 
+  // 这里为什么不考虑 level 0 ?
+  // 因为页节点的第一个 rec 删了, 还是可以从 parent 找过来
+  // 即, parent 指向的区间没有问题
   if (level > 0 &&
       UNIV_UNLIKELY(rec == page_rec_get_next(page_get_infimum_rec(page)))) {
     rec_t *next_rec = page_rec_get_next(rec);
@@ -4955,11 +4998,15 @@ ibool btr_cur_pessimistic_delete(
       so that it is equal to the new leftmost node pointer
       on the page */
 
+      // 走到这里, 删除中间节点的第一条 rec
+      // 因此要向上删除 current block 在 parrent 中的 node ptr
       btr_node_ptr_delete(index, block, mtr);
 
+      // 再用 next rec 构建 node ptr
       dtuple_t *node_ptr = dict_index_build_node_ptr(
           index, next_rec, block->page.id.page_no(), heap, level);
 
+      // 把新的 node ptr 插入 parent
       btr_insert_on_non_leaf_level(flags, index, level + 1, node_ptr, mtr);
 
       ut_d(parent_latched = true);
@@ -5251,10 +5298,12 @@ static int64_t btr_estimate_n_rows_in_range_low(
   bool should_count_the_left_border;
 
   if (dtuple_get_n_fields(tuple1) > 0) {
+    // S lock 加了一路
     btr_cur_search_to_nth_level(index, 0, tuple1, mode1,
                                 BTR_SEARCH_LEAF | BTR_ESTIMATE, &cursor, 0,
                                 __FILE__, __LINE__, &mtr);
 
+    // mode1 肯定是 > or >=
     ut_ad(!page_rec_is_infimum(btr_cur_get_rec(&cursor)));
 
     /* We should count the border if there are any records to
@@ -5266,9 +5315,11 @@ static int64_t btr_estimate_n_rows_in_range_low(
     should_count_the_left_border =
         !page_rec_is_supremum(btr_cur_get_rec(&cursor));
   } else {
+    // tuple 空, 找到 leaf level 最左一个 rec
     btr_cur_open_at_index_side(true, index, BTR_SEARCH_LEAF | BTR_ESTIMATE,
                                &cursor, 0, &mtr);
 
+    // 定位到 leaf level 最左
     ut_ad(page_rec_is_infimum(btr_cur_get_rec(&cursor)));
 
     /* The range specified is wihout a left border, just

@@ -379,7 +379,7 @@ int ha_recover(const memroot_unordered_set<my_xid> *commit_list) {
   info.found_foreign_xids = info.found_my_xids = 0;
   info.commit_list = commit_list;
 
-  // commit_list = 0 表示所有 prepared 的都要回滚 
+  // commit_list = 0 表示所有 prepared 的都要回滚
   // innodb：prepared 阶段的事务肯定属于 last binlog
   //         因为，binlog rotate 时候已经强制 commit 了
   //

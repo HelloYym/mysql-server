@@ -62,6 +62,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
            mtr_memo_contains(mtr, block, MTR_MEMO_PAGE_X_FIX)) &&
           (block->page.buf_fix_count > 0));
   } else {
+    // 当前 block 肯定已经被 lock 了
     ut_ad(mtr_memo_contains(mtr, block, MTR_MEMO_PAGE_S_FIX) ||
           mtr_memo_contains(mtr, block, MTR_MEMO_PAGE_X_FIX) ||
           index->table->is_intrinsic());
@@ -89,6 +90,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
     return;
   }
 
+  // m_rel_pos 指向真正的 rec 位置
   if (page_rec_is_supremum_low(offs)) {
     rec = page_rec_get_prev(rec);
 
@@ -110,6 +112,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
   m_block_when_stored = block;
 
   /* Function try to check if block is S/X latch. */
+  // 读取一个 block 的 modify clock 时候一定要加锁, 否则别的线程可能在修改
   m_modify_clock = buf_block_get_modify_clock(block);
   m_withdraw_clock = buf_withdraw_clock;
 }
@@ -143,12 +146,14 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
 
   auto index = btr_cur_get_index(get_btr_cur());
 
+  // store 的时候 btree 一定是空的
   if (m_rel_pos == BTR_PCUR_AFTER_LAST_IN_TREE ||
       m_rel_pos == BTR_PCUR_BEFORE_FIRST_IN_TREE) {
     /* In these cases we do not try an optimistic restoration,
     but always do a search */
-    // 之前 page 是空的
 
+    // 直接做一次 search, 找到 btree 中 leftmost 或 rightmost 的 page
+    // 这里把 btr_cur 放到指定位置
     btr_cur_open_at_index_side(m_rel_pos == BTR_PCUR_BEFORE_FIRST_IN_TREE,
                                index, latch_mode, get_btr_cur(), 0, mtr);
 
@@ -206,6 +211,8 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
         return (true);
       }
 
+      // 走到这里说明 m_rel_pos 之前不在 user rec 上面
+      // 因此要前后移动一下
       /* This is the same record as stored,
       may need to be adjusted for BTR_PCUR_BEFORE/AFTER,
       depending on search mode and direction. */
@@ -215,6 +222,10 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
       return (false);
     }
   }
+
+  // 为什么不能一直 retry 乐观 restore???
+  // 因为保存的 m_old_block 已经改变了, 我们现在已经不知道需要的 current block 是谁了
+  // 因此只有根据保存的 rec 重新 search 一遍到正确的 current block
 
   /* If optimistic restoration did not succeed, open the cursor anew */
 
@@ -245,7 +256,7 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
   }
 
   // 调用 search_to_nth_level 重新找到 old_rec
-  // 并且已经加好 latch 了
+  // 并且已经根据 latch_mode 加好 latch 了
   open_no_init(index, tuple, mode, latch_mode, 0, mtr, file, line);
 
   /* Restore the old search mode */
@@ -339,6 +350,7 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
 
 void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   ut_ad(m_latch_mode != BTR_NO_LATCHES);
+  // 一定已经移动到了 inf rec 上
   ut_ad(is_before_first_on_page());
   ut_ad(!is_before_first_in_tree(mtr));
 
@@ -350,6 +362,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
     latch_mode2 = BTR_SEARCH_PREV;
 
   } else if (m_latch_mode == BTR_MODIFY_LEAF) {
+    // 除了 change buffer 还会有这种情况吗???
     latch_mode2 = BTR_MODIFY_PREV;
   } else {
     latch_mode2 = 0; /* To eliminate compiler warning */
@@ -359,12 +372,14 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   // 保存当前 page 的信息
   store_position(mtr);
 
-  // 释放当前 block 的 latch
-  // 因为要保证从左到右的加锁顺序
+  // 释放当前 block 的 latch, 准备从左到右加锁
   mtr_commit(mtr);
 
   mtr_start(mtr);
 
+  // restore position 之后 page cur 是否指向之前的 rec???
+  // 如果是乐观restore, 肯定是指向之前的位置, 因为没人动过当前 pcur 的 page cur
+  // 如果是悲观restore, 肯定定位到了正确的位置
   restore_position(latch_mode2, mtr, __FILE__, __LINE__);
 
   auto page = get_page();
@@ -378,6 +393,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
     if (prev_page_no == FIL_NULL) {
       ;
     } else if (is_before_first_on_page()) {
+      // 这种情况肯定是 乐观restore 回来的, 悲观restore 不会定在 inf上
       prev_block = get_btr_cur()->left_block;
 
       btr_leaf_page_release(get_block(), old_latch_mode, mtr);
@@ -389,6 +405,8 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
       also on the previous page, but we do not need the latch:
       release it. */
 
+      // 这里肯定是悲观restore 回来的, cur在left page上, 并锁住了更前一个page
+      // 要释放掉
       prev_block = get_btr_cur()->left_block;
 
       btr_leaf_page_release(prev_block, old_latch_mode, mtr);

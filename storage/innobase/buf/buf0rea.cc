@@ -105,6 +105,8 @@ static ulint buf_read_page_low(dberr_t *err, bool sync, ulint type, ulint mode,
   or is being dropped; if we succeed in initing the page in the buffer
   pool for read, then DISCARD cannot proceed until the read has
   completed */
+  // 初始化一个结构体 buf_block_t/buf_page_t 表示即将 read 的 page
+  // block->lock 加了非递归 X, 等待 IO 线程完成后来释放
   bpage = buf_page_init_for_read(err, mode, page_id, page_size, unzip);
 
   if (bpage == NULL) {

@@ -252,6 +252,7 @@ struct Add_dirty_blocks_to_flush_list {
 
     block = reinterpret_cast<buf_block_t *>(slot->object);
 
+    // 修改 oldest/newest lsn, 并add flush list
     buf_flush_note_modification(block, m_start_lsn, m_end_lsn,
                                 m_flush_observer);
 #endif /* !UNIV_HOTBACKUP */
@@ -562,6 +563,7 @@ ulint mtr_t::Command::prepare_write() {
 
   ut_a(!recv_recovery_is_on() || !recv_no_ibuf_operations);
 
+  // mtr 中所有 redolog rec 的 size
   ulint len = m_impl->m_log.size();
   ut_ad(len > 0);
 
@@ -583,6 +585,7 @@ ulint mtr_t::Command::prepare_write() {
     /* Flag the single log record as the
     only record in this mini-transaction. */
 
+    // 标记 single rec flag, 在 recover 时就不需要去找 mtr endrec
     *m_impl->m_log.front()->begin() |= MLOG_SINGLE_REC_FLAG;
 
   } else {
@@ -590,6 +593,7 @@ ulint mtr_t::Command::prepare_write() {
     multiple log records, append MLOG_MULTI_REC_END
     at the end. */
 
+    // multiple recs 需要在 mtr 最后添加一条 end rec
     mlog_catenate_ulint(&m_impl->m_log, MLOG_MULTI_REC_END, MLOG_1BYTE);
     ++len;
   }
@@ -671,7 +675,9 @@ void mtr_t::Command::execute() {
   }
 #endif /* !UNIV_HOTBACKUP */
 
+  // 释放 latch 和 block buffix
   release_all();
+  // 清空 mtr
   release_resources();
 }
 

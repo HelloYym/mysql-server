@@ -498,6 +498,7 @@ void buf_flush_insert_into_flush_list(
   ut_ad(mutex_own(buf_page_get_mutex(&block->page)));
   ut_ad(log_sys != nullptr);
 
+  // 每个 buf_pool 有自己的 flush list
   buf_flush_list_mutex_enter(buf_pool);
 
   /* If we are in the recovery then we need to update the flush
@@ -550,15 +551,22 @@ void buf_flush_insert_into_flush_list(
   }
 
   ut_ad(log_lsn_validate(lsn));
+
+  // 之前没人改过这个 block
   ut_ad(block->page.oldest_modification == 0);
+  // 最新一次修改的 end_lsn 一定大于 start_lsn
   ut_ad(block->page.newest_modification >= lsn);
 
   ut_ad(UT_LIST_GET_FIRST(buf_pool->flush_list) == NULL ||
+        // flush list 第一个 block 的 lsn 相差不能超过 recent_closed 大小
         buf_flush_list_order_validate(
             UT_LIST_GET_FIRST(buf_pool->flush_list)->oldest_modification, lsn));
 
+  // block 第一次被加入 flush list 时对应的 redolog lsn
+  // 之后可能被其它 mtr 修改, 但是位置不变
   block->page.oldest_modification = lsn;
 
+  // 当前 page 挂到 flush list 开头
   UT_LIST_ADD_FIRST(buf_pool->flush_list, &block->page);
 
   incr_flush_list_size_in_bytes(block, buf_pool);

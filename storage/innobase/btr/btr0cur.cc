@@ -679,7 +679,7 @@ void btr_cur_search_to_nth_level(
   ulint root_height = 0; /* remove warning */
 
   // upper_rw_latch 是什么意思?
-  // 中间 level 加什么锁
+  // 非叶节点 加什么锁
   ulint upper_rw_latch, root_leaf_rw_latch;
   // 当前遍历对 btree 的潜在影响
   btr_intention_t lock_intention;
@@ -912,7 +912,7 @@ void btr_cur_search_to_nth_level(
           BTR_ALREADY_S_LATCHED */
           ut_ad(latch_mode != BTR_SEARCH_TREE);
 
-          // BTR_SEARCH_LEAF 会走到这个地方，拿到 index s latch
+          // BTR_SEARCH_LEAF/BTR_MODIFY_LEAF 会走到这个地方，拿到 index s latch
           mtr_s_lock(dict_index_get_lock(index), mtr);
         } else if (!par_read_init) {
           /* BTR_MODIFY_EXTERNAL needs to be excluded */

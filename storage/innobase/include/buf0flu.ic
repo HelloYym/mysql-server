@@ -79,8 +79,16 @@ void buf_flush_note_modification(
 
   mutex_enter(&block->mutex);
 
+  // 为什么 newest_modification 为 end_lsn
+  // 而 oldest_modification 为 start_lsn?
+  // 1. oldest_modification 限制 checkpoint, flush list 上第一个block还没flush, 因此只能删之前的 redolog(因此用 start_lsn)
+  // 2. newest_modification 限制 flush, 要 flush 一个 block, 所有修改它的 mtr 要落盘(包括当前log, 因此用 end_lsn)
+
   if (end_lsn != 0) {
     ut_ad(block->page.newest_modification <= end_lsn);
+    // 不管 block 在不在 flush list 里面
+    // newest_modification 都更新为 最新修改这个 block 的 redolog 末尾
+    // 当要 刷脏 这个page 时, newest_modification 之前的 redolog 要落盘
     block->page.newest_modification = end_lsn;
   } else {
     /* Do nothing. This is the case with no-redo mtr and it
@@ -99,6 +107,8 @@ void buf_flush_note_modification(
   block->page.flush_observer = observer;
 
   if (block->page.oldest_modification == 0) {
+    // block 之前不在 flush list
+    // 把它加到对应 buf pool 的 flush list
     buf_pool_t *buf_pool = buf_pool_from_block(block);
 
     buf_flush_insert_into_flush_list(buf_pool, block, start_lsn);

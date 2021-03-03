@@ -2888,6 +2888,8 @@ static bool recv_multi_rec(byte *ptr, byte *end_ptr) {
   ulint n_recs = 0;
   ulint total_len = 0;
 
+  // 找到 mtr 的终点rec, MLOG_MULTI_REC_END
+  // 如果在找到终点之前出现了 single rec flag, 说明出错
   for (;;) {
     mlog_id_t type;
     byte *body;
@@ -2906,6 +2908,8 @@ static bool recv_multi_rec(byte *ptr, byte *end_ptr) {
       return (true);
 
     } else if ((*ptr & MLOG_SINGLE_REC_FLAG)) {
+      // 前一个 multi rec mtr 还没结束, 就遇到一个 single rec mtr
+      // 出错
       recv_sys->found_corrupt_log = true;
 
       recv_report_corrupt_log(ptr, type, space_id, page_no);
@@ -2927,6 +2931,7 @@ static bool recv_multi_rec(byte *ptr, byte *end_ptr) {
 
     ptr += len;
 
+    // 直到找到 mtr end
     if (type == MLOG_MULTI_REC_END) {
       DBUG_PRINT("ib_log", ("scan " LSN_PF ": multi-log end total_len " ULINTPF
                             " n=" ULINTPF,
@@ -3066,6 +3071,7 @@ static void recv_parse_log_recs(lsn_t checkpoint_lsn) {
         single_rec = !!(*ptr & MLOG_SINGLE_REC_FLAG);
     }
 
+    // 如果一个 record 开头没有 single rec 标记, 说明是 mtr 开头, mtr 包含多个 rec
     if (single_rec) {
       if (recv_single_rec(ptr, end_ptr)) {
         return;

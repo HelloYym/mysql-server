@@ -2086,7 +2086,7 @@ dberr_t trx_undo_report_row_operation(
   }
 #endif /* UNIV_DEBUG */
 
-  根据当前操作的类型，在回滚段中找到或者申请一个undo链表
+  // 根据当前操作的类型，在回滚段中找到或者申请一个undo链表
   switch (op_type) {
     case TRX_UNDO_INSERT_OP:
       undo = undo_ptr->insert_undo;

@@ -614,6 +614,7 @@ dberr_t DDL_Log_Table::search_all(DDL_Records &records) {
   mtr_start(&mtr);
 
   /** Scan the index in decreasing order. */
+  // pcur 放到最右侧
   btr_pcur_open_at_index_side(false, index, BTR_SEARCH_LEAF, &pcur, true, 0,
                               &mtr);
 

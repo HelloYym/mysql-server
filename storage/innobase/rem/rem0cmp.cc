@@ -659,6 +659,9 @@ int cmp_dtuple_rec_with_match_low(const dtuple_t *dtuple, const rec_t *rec,
     ulint rec_info = rec_get_info_bits(rec, rec_offs_comp(offsets));
     ulint tup_info = dtuple_get_info_bits(dtuple);
 
+    // 如果没有 REC_INFO_MIN_REC_FLAG, 如果插入一个全局最小tuple, 在中间节点就定位到 inf rec上,
+    // 无法继续走到 leaf level 进行插入
+    // 使用 REC_INFO_MIN_REC_FLAG, 全局最小 tuple 在中间层也会定位到 first rec 上, 进而走到最左 leaf page, 在 leaf page 中定位到 inf 后进行插入
     /* The leftmost node pointer record is defined as
     smaller than any other node pointer, independent of
     any ASC/DESC flags. It is an "infimum node pointer". */
@@ -701,6 +704,7 @@ int cmp_dtuple_rec_with_match_low(const dtuple_t *dtuple, const rec_t *rec,
         dict_index_is_ibuf(index) || index->get_field(cur_field)->is_ascending,
         dtuple_b_ptr, dtuple_f_len, rec_b_ptr, rec_f_len);
     if (ret) {
+      // 如果第 n 个 field 不相等, 后面的就不用比较了, 并且前面的 field 肯定是相等的
       goto order_resolved;
     }
   }

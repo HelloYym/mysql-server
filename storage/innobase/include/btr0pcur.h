@@ -682,6 +682,10 @@ inline void btr_pcur_t::open_no_init(dict_index_t *index, const dtuple_t *tuple,
                                      const char *file, ulint line) {
   m_latch_mode = BTR_LATCH_MODE_WITHOUT_INTENTION(latch_mode);
 
+  // 为什么要设置 pcur->m_search_mode?
+  // nth_level 中需要用到这个吗?
+  // 因为 nth_level search 到的位置保存在 pcur->cur中了
+  // 而此时 pcur 的状态 m_search_mode 应该是 mode
   m_search_mode = mode;
 
   /* Search with the tree cursor */
@@ -953,6 +957,7 @@ inline bool btr_pcur_t::move_to_next(mtr_t *mtr) {
     return (true);
   }
 
+  // 单纯往右移动一个 rec, 可能走到当前 page 的 sup rec
   move_to_next_on_page();
 
   return (true);

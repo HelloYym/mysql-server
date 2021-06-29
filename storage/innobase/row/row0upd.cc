@@ -2078,6 +2078,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   able to invoke thd_get_trx(). */
   btr_pcur_get_btr_cur(&pcur)->thr = thr;
 
+  // 定位到 sk index 的指定 rec 上
   search_result = row_search_index_entry(index, entry, mode, &pcur, &mtr);
 
   btr_cur = btr_pcur_get_btr_cur(&pcur);
@@ -2126,6 +2127,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     case ROW_FOUND:
       ut_ad(err == DB_SUCCESS);
 
+      // 对找到的 sk rec 进行 delete mark
       /* Delete mark the old index record; it can already be
       delete marked if we return after a lock wait in
       row_ins_sec_index_entry() below */
@@ -2154,6 +2156,11 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   btr_pcur_close(&pcur);
   mtr_commit(&mtr);
 
+  // delete mark 掉旧的 rec
+  // 此时其它事务走到这个 rec, 会去找 clust index 中的 rec, 因此可以获得版本链
+  // (sk rec 是 delete mark 时, 一定会去找 clust index)
+  // (clust index 会先 update?, 是的)
+
   if (node->is_delete || err != DB_SUCCESS) {
     goto func_exit;
   }
@@ -2164,6 +2171,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   entry = row_build_index_entry(node->upd_row, node->upd_ext, index, heap);
   ut_a(entry);
 
+  // 用一个新的 mtr 进行插入
   /* Insert new index entry */
   err = row_ins_sec_index_entry(index, entry, thr, false);
 
@@ -2499,6 +2507,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_upd_clust_rec(
   trx_id_t trx_id = thr_get_trx(thr)->id;
   trx_t *trx = thr_get_trx(thr);
 
+  // 必须是 clust index
   ut_ad(node);
   ut_ad(index->is_clustered());
   ut_ad(!thr_get_trx(thr)->in_rollback);
@@ -2507,6 +2516,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_upd_clust_rec(
   btr_cur = btr_pcur_get_btr_cur(pcur);
 
   ut_ad(btr_cur_get_index(btr_cur) == index);
+  // 要 update 的 rec 不能是已经被 delete mark 的
   ut_ad(!rec_get_deleted_flag(btr_cur_get_rec(btr_cur),
                               dict_table_is_comp(index->table)));
   ut_ad(rec_offs_validate(btr_cur_get_rec(btr_cur), index, offsets));
@@ -2538,6 +2548,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_upd_clust_rec(
     goto success;
   }
 
+  // 如果乐观更新不成功, 说明new rec 太大了, 就得 BTR_MODIFY_TREE 来一遍
   mtr->commit();
 
   if (buf_LRU_buf_pool_running_out()) {
@@ -2568,6 +2579,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_upd_clust_rec(
   the same transaction do not modify the record in the meantime.
   Therefore we can assert that the restoration of the cursor succeeds. */
 
+  // 放开 block X latch 后, 还站着 rec lock, 因此其它事务不能修改这个 rec, restore 一定能成功
+
   ut_a(btr_pcur_restore_position(BTR_MODIFY_TREE, pcur, mtr));
 
   ut_ad(!rec_get_deleted_flag(btr_pcur_get_rec(pcur),
@@ -2577,6 +2590,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_upd_clust_rec(
     heap = mem_heap_create(1024);
   }
 
+  // 悲观更新
   err = btr_cur_pessimistic_update(
       flags | BTR_NO_LOCKING_FLAG | BTR_KEEP_POS_FLAG, btr_cur, &offsets,
       offsets_heap, heap, &big_rec, node->update, node->cmpl_info, thr, trx_id,
@@ -2875,6 +2889,7 @@ static dberr_t row_upd(upd_node_t *node, /*!< in: row update node */
       if (!node->table->is_intrinsic()) {
         log_free_check();
       }
+      // 先更新 clust index
       err = row_upd_clust_step(node, thr);
 
       if (err != DB_SUCCESS) {

@@ -204,6 +204,7 @@ ulint btr_height_get(dict_index_t *index, /*!< in: index tree */
         index->table->is_intrinsic());
 
   /* S latches the page */
+  // 只需要 S latch root, 树的层数就不会变化, 因为 root raise 需要 X latch root
   root_block = btr_root_block_get(index, RW_S_LATCH, mtr);
 
   height = btr_page_get_level(buf_block_get_frame(root_block), mtr);
@@ -2431,9 +2432,9 @@ func_start:
   ut_ad(!page_is_empty(page));
 
   /* try to insert to the next page if possible before split */
-  // 这里可能修改 sibling 节点的 father
-  // 但是这种情况已经加了 current node 和 sibling node 的最近公共祖先的 latch
-  // 这里会加 sibling father 的 latch 吗
+	// 为了解决 Bug #67718
+  // 这里会反向加 sibling father 的 latch
+  // 这种情况已经加了 current node 和 sibling node 的最近公共祖先的 latch
   rec = btr_insert_into_right_sibling(flags, cursor, offsets, *heap, tuple,
                                       n_ext, mtr);
 
@@ -2467,6 +2468,9 @@ func_start:
 
   } else if (btr_page_get_split_rec_to_left(cursor, &split_rec)) {
     // 顺序向左分裂，新建的 new_page 放在左边
+		// 两个目的
+		// 减少移动的 rec
+    // 同 level 的 page no 递增连续
     direction = FSP_DOWN;
     // 意向的 page
     hint_page_no = page_no - 1;
@@ -2540,7 +2544,6 @@ func_start:
     // next page first rec 就是新插入的 tuple rec
     // 这是一个临时的 buf
     first_rec = rec_convert_dtuple_to_rec(buf, cursor->index, tuple, n_ext);
-    // cursor 处于要 insert 的位置
     move_limit = page_rec_get_next(btr_cur_get_rec(cursor));
   }
 
@@ -2597,6 +2600,10 @@ func_start:
       the original page.  Copy the page byte for byte
       and then delete the records from both pages
       as appropriate.  Deleting will always succeed. */
+      // 如果 new_block 压缩失败
+      // new_block 中的 rec 一定 <= block
+      // 先把 block 直接物理复制过去
+      // 再删除两个 block 中不需要的 rec, 删除操作是一定成功的
       ut_a(new_page_zip);
 
       page_zip_copy_recs(new_page_zip, new_page, page_zip, page, cursor->index,
@@ -2977,10 +2984,20 @@ static buf_block_t *btr_lift_page_up(
       blocks[n_blocks++] = b = btr_cur_get_block(&cursor);
     }
 
+    // blocks[0] 是 father 的 father
+    // blocks[n_blocks - 1] 是 root
+
+    // 如果是 leaf node 做 lift_up, 实际操作的是 father node
+    // 保持 segment 一致
     lift_father_up = (n_blocks && page_level == 0);
     if (lift_father_up) {
       /* The father page also should be the only on its level (not
       root). We should lift up the father page at first.
+
+      如果 current block 是 leaf, 就不能把 rec 移到 father 再 free current block
+      会造成 segment 错乱, leaf 和 non-leaf 是分开存的
+      (如果father 就是 root 则不受这个限制的影响)
+
       Because the leaf page should be lifted up only for root page.
       The freeing page is based on page_level (==0 or !=0)
       to choose segment. If the page_level is changed ==0 from !=0,
@@ -3087,6 +3104,8 @@ static buf_block_t *btr_lift_page_up(
  page. If cursor is on the leaf level, mtr must also hold x-latches to the
  brothers, if they exist.
  @return true on success */
+// 1. 只有 leaf level 需要加三个 latch, 因为 non-leaf level 不会有其它线程横向遍历
+// 2. left merge 要求 left page 与 current page 同 parent
 ibool btr_compress(
     btr_cur_t *cursor, /*!< in/out: cursor on the page to merge
                        or lift; the page must not be empty:
@@ -3187,6 +3206,7 @@ ibool btr_compress(
     goto func_exit;
   }
 
+  // block 是其 parent 的第一个 child
   ut_d(leftmost_child =
            left_page_no != FIL_NULL &&
            (page_rec_get_next(page_get_infimum_rec(btr_cur_get_page(
@@ -4316,6 +4336,7 @@ loop:
 
   ut_a(block->page.id.space() == index->space);
 
+  // 对 block 做各种 check
   if (fseg_page_is_free(seg, block->page.id.space(),
                         block->page.id.page_no())) {
     btr_validate_report1(index, level, block);
@@ -4357,6 +4378,7 @@ loop:
 
     right_page = buf_block_get_frame(right_block);
 
+    // 检查 link list
     if (btr_page_get_prev(right_page, &mtr) != page_get_page_no(page)) {
       btr_validate_report2(index, level, block, right_block);
       fputs(
@@ -4382,6 +4404,7 @@ loop:
     offsets2 =
         rec_get_offsets(right_rec, index, offsets2, ULINT_UNDEFINED, &heap);
 
+    // 检查 key ordering
     /* For spatial index, we cannot guarantee the key ordering
     across pages, so skip the record compare verification for
     now. Will enhanced in special R-Tree index validation scheme */
@@ -4442,6 +4465,7 @@ loop:
     offsets = btr_page_get_father_node_ptr_for_validate(offsets, heap,
                                                         &node_cur, &mtr);
 
+    // 用 block 的 first 和 last rec 去拿 parent
     if (node_ptr != btr_cur_get_rec(&node_cur) ||
         btr_node_ptr_get_child_page_no(node_ptr, offsets) !=
             block->page.id.page_no()) {
@@ -4572,6 +4596,7 @@ node_ptr_fails:
   } else if (right_page_no != FIL_NULL) {
     mtr_start(&mtr);
 
+    // 先把 right page 对应的 parent 拿回来
     if (!lockout) {
       if (rightmost_child) {
         if (parent_right_page_no != FIL_NULL) {
@@ -4708,6 +4733,7 @@ static bool btr_can_merge_with_page(
   const page_id_t page_id(dict_index_get_space(index), page_no);
   const page_size_t page_size(dict_table_page_size(index->table));
 
+  // 拿到 merge_block 加 X
   mblock = btr_block_get(page_id, page_size, RW_X_LATCH, index, mtr);
   mpage = buf_block_get_frame(mblock);
 

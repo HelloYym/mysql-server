@@ -330,6 +330,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   rec = btr_cur_get_rec(cursor);
 
+  // 必须是 delete mark 的 rec 才能 insert by modify
   ut_ad(rec_get_deleted_flag(rec, dict_table_is_comp(cursor->index->table)));
 
   /* Build an update vector containing all the fields to be modified;
@@ -1905,6 +1906,9 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   dtuple_set_n_fields_cmp(entry, n_unique);
 
+  // 这里重新 mtr start, 拿到 page S latch
+  // 此时多个事务可以同时进来检查 dup
+  // 注意这里是 GE, 即 equal range 的开始
   btr_pcur_open(
       index, entry, PAGE_CUR_GE,
       s_latch ? BTR_SEARCH_LEAF | BTR_ALREADY_S_LATCHED : BTR_SEARCH_LEAF,
@@ -1913,6 +1917,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   allow_duplicates = thr_get_trx(thr)->duplicates;
 
   /* Scan index records and check if there is a duplicate */
+  // 同一个 SK 在二级索引中, 可能 match 多个 rec(只有一个alive, 其它被 delete mark)
+  // 主索引中不会出现
 
   do {
     const rec_t *rec = btr_pcur_get_rec(&pcur);
@@ -1922,6 +1928,11 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     found. This means it is possible for another transaction to
     insert a duplicate key value but MDL protection on DD tables
     will prevent insertion of duplicates into unique secondary indexes*/
+    // 二级索引 无论是RR还是RC隔离级别 都需要加 S LOCK_ORDINARY
+    // 否则导致二级索引唯一约束失效
+    // 月报: http://mysql.taobao.org/monthly/2021/04/05/
+    // 官方bug: https://bugs.mysql.com/bug.php?id=68021
+    // 主索引为什么没有问题? 因为一个线程会占着 page X latch
     const ulint lock_type =
         index->table->skip_gap_locks() ? LOCK_REC_NOT_GAP : LOCK_ORDINARY;
 
@@ -1971,6 +1982,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
         }
       }
 
+      // do-while 循环开头没有检查 rec 是否 equal
+      // 所以最终 lock 了 equal range 的后一个 rec
       err = row_ins_set_shared_rec_lock(lock_type, block, rec, index, offsets,
                                         thr);
     }
@@ -2125,6 +2138,9 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   ut_ad(cursor->index->is_clustered());
 
+  // 因为二级索引总是先删除后插入, 所以可能有很多 key 一样的 rec, 但是关联的 pk 不同
+  // 删除时为了一致性读, 只做了delete mark
+  // 因此二级索引检查唯一性要做 scan, 因为 index 中 key 不唯一
   /* NOTE: For unique non-clustered indexes there may be any number
   of delete marked records with the same value for the non-clustered
   index key (remember multiversioning), and which differ only in
@@ -2143,6 +2159,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   if (cursor->low_match >= n_unique) {
     rec = btr_cur_get_rec(cursor);
 
+    // 当前定位到一条 user rec 上面
     if (!page_rec_is_infimum(rec)) {
       offsets =
           rec_get_offsets(rec, cursor->index, offsets, ULINT_UNDEFINED, &heap);
@@ -2165,6 +2182,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
                                              btr_cur_get_block(cursor), rec,
                                              cursor->index, offsets, thr);
       } else {
+        // 加正常 rec S lock
+        // 可能等待
         err = row_ins_set_shared_rec_lock(LOCK_REC_NOT_GAP,
                                           btr_cur_get_block(cursor), rec,
                                           cursor->index, offsets, thr);
@@ -2178,6 +2197,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
           goto func_exit;
       }
 
+      // 找到的 rec 上没有 delete mark, 就会返回 duplicate key
       if (row_ins_dupl_error_with_rec(rec, entry, cursor->index, offsets)) {
       duplicate:
         trx->error_index = cursor->index;
@@ -2254,6 +2274,9 @@ ibool row_ins_must_modify_rec(const btr_cur_t *cursor) /*!< in: B-tree cursor */
   A clustered index node pointer contains index->n_unique first fields,
   and a secondary index node pointer contains all index fields. */
 
+  // leaf page 的 first rec 删除后不会更新上层的 node ptr
+  // 因此此时从 node ptr 走下来可能定位到 inf rec 上面
+  // 即 user rec 并没有找到
   return (cursor->low_match >= dict_index_get_n_unique_in_tree(cursor->index) &&
           !page_rec_is_infimum(btr_cur_get_rec(cursor)));
 }
@@ -2387,6 +2410,7 @@ and return. don't execute actual insert. */
         !thr_get_trx(thr)->in_rollback);
   ut_ad(thr != NULL || !dup_chk_only);
 
+  // 开始执行一次 insert
   mtr.start();
 
   if (index->table->is_temporary()) {
@@ -2441,6 +2465,7 @@ and return. don't execute actual insert. */
     }
   }
 
+  // 主索引不允许重复
   /* Allowing duplicates in clustered index is currently enabled
   only for intrinsic table and caller understand the limited
   operation that can be done in this case. */
@@ -2472,6 +2497,7 @@ and return. don't execute actual insert. */
       /* Note that the following may return also
       DB_LOCK_WAIT */
 
+      // 主键判重的主函数
       err = row_ins_duplicate_error_in_clust(flags, cursor, entry, thr, &mtr);
     }
 
@@ -2503,6 +2529,8 @@ and return. don't execute actual insert. */
     if (index->last_sel_cur) {
       index->last_sel_cur->invalid = true;
     }
+
+    // 原来的 delete marked rec 可能被删除, 挂到 page 的 free list 上面
 
     ut_ad(thr != NULL);
     err = row_ins_clust_index_entry_by_modify(&pcur, flags, mode, &offsets,
@@ -2912,8 +2940,11 @@ dberr_t row_ins_sec_index_entry_low(ulint flags, ulint mode,
 
   n_unique = dict_index_get_n_unique(index);
 
+  // 跳过不需要判重的情况
   if (dict_index_is_unique(index) &&
       (cursor.low_match >= n_unique || cursor.up_match >= n_unique)) {
+    // 判重前先放掉 page X latch
+    // 重新占着 page S latch 去判重
     mtr_commit(&mtr);
 
     DEBUG_SYNC_C("row_ins_sec_index_unique");
@@ -2982,6 +3013,8 @@ dberr_t row_ins_sec_index_entry_low(ulint flags, ulint mode,
     goto func_exit;
   }
 
+  // 这里 insert by modify 要求 entry 的 sk 和 pk 都相等
+  // 而之前检查 dup 时候只看了 sk
   if (row_ins_must_modify_rec(&cursor)) {
     /* If the existing record is being modified and the new record
     is doesn't fit the provided slot then existing record is added

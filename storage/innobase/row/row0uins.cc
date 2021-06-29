@@ -191,6 +191,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     modify_leaf = true;
   } else {
     ut_ad(mode == (BTR_MODIFY_TREE | BTR_LATCH_FOR_DELETE));
+    // 为什么要提前 lock index
     mtr_sx_lock(dict_index_get_lock(index), &mtr);
   }
 

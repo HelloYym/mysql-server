@@ -616,20 +616,29 @@ index page: we know then that the lock
 request is really for a 'gap' type lock */
 {
   ut_ad(trx && lock2);
+  // lock type 是 rec 还是 table
+  // lock mode 是 S 还是 X
   ut_ad(lock_get_type_low(lock2) == LOCK_REC);
 
+  // 先检查 X 和 S 是否兼容
+  // 如果都是 S, 就不用比较了
   if (trx != lock2->trx &&
       !lock_mode_compatible(static_cast<lock_mode>(LOCK_MODE_MASK & type_mode),
                             lock_get_mode(lock2))) {
     /* We have somewhat complex rules when gap type record locks
     cause waits */
 
+    // lock_is_on_supremum 就表示最后一个 gap lock
     if ((lock_is_on_supremum || (type_mode & LOCK_GAP)) &&
         !(type_mode & LOCK_INSERT_INTENTION)) {
       /* Gap type locks without LOCK_INSERT_INTENTION flag
       do not need to wait for anything. This is because
       different users can have conflicting lock types
       on gaps. */
+      // 只申请 gap lock 不需要等任何锁:
+      // 1. lock2 已经占 gap lock, 多个事务可以同时持有一个 gap lock, 不需要互相等待
+      // 2. lock2 占的是 rec, 并没有锁住 gap
+      // Note: gap lock 只用于禁止 insert
 
       return (false);
     }
@@ -637,17 +646,30 @@ request is really for a 'gap' type lock */
     if (!(type_mode & LOCK_INSERT_INTENTION) && lock_rec_get_gap(lock2)) {
       /* Record lock (LOCK_ORDINARY or LOCK_REC_NOT_GAP
       does not need to wait for a gap type lock */
+      // 如果 lock2 只占了 gap
+      // 那当前申请只要不是 insert 就可以成功:
+      // 1. LOCK_ORDINARY: 加 rec 和 gap
+      // 2. LOCK_REC_NOT_GAP: 只加 rec
 
       return (false);
     }
 
     if ((type_mode & LOCK_GAP) && lock_rec_get_rec_not_gap(lock2)) {
+      // 此时应该 assert 一下(否则会走到第一个 if):
+      // assert(type_mode & LOCK_INSERT_INTENTION);
+      // 一定是要 insert
+      // 如果 lock2 没有占 gap, 就不需要等
+
       /* Lock on gap does not need to wait for
       a LOCK_REC_NOT_GAP type lock */
 
       return (false);
     }
 
+    // 如果 lock2 在等 gap lock, 持有的是 insert intention lock
+    // 所有 lock 请求都不需要等它:
+    // 1. 两个 insert intention lock 不需要互相等待, 它们最终都等在 gap lock 上面
+    // 2. next-key lock 等待它会死锁
     if (lock_rec_get_insert_intention(lock2)) {
       /* No lock request needs to wait for an insert
       intention lock to be removed. This is ok since our
@@ -962,7 +984,9 @@ static const lock_t *lock_rec_other_has_conflicting(
   RecID rec_id{block, heap_no};
   const bool is_supremum = rec_id.is_supremum();
 
+  // 遍历 rec 上面的每个 lock
   auto lock = Lock_iter::for_each(rec_id, [=](const lock_t *lock) {
+    // 判断是否要等锁
     if (lock_rec_has_to_wait(trx, mode, lock, is_supremum)) {
       return (false);
     }
@@ -2678,6 +2702,7 @@ static void lock_rec_reset_and_release_wait(
                               the record */
     ulint heap_no)            /*!< in: heap number of record */
 {
+  // 等在当前 rec 上面的 事务锁 的 heap no 位置都可以重置了
   lock_rec_reset_and_release_wait_low(lock_sys->rec_hash, block, heap_no);
 
   lock_rec_reset_and_release_wait_low(lock_sys->prdt_hash, block,
@@ -3573,6 +3598,7 @@ void lock_rec_store_on_page_infimum(
                               bits are reset on the
                               record */
 {
+  // rec 在 page 中的编号
   ulint heap_no = page_rec_get_heap_no(rec);
 
   ut_ad(block->frame == page_align(rec));
@@ -5619,7 +5645,9 @@ dberr_t lock_rec_insert_check_and_lock(
   lock_t *lock;
   ibool inherit_in = *inherit;
   trx_t *trx = thr_get_trx(thr);
+  // next_rec 用于检查是否有 gap lock, 因为 gap lock 是加在 rec 前面的
   const rec_t *next_rec = page_rec_get_next_const(rec);
+  // next_rec 在 page 中的序号
   ulint heap_no = page_rec_get_heap_no(next_rec);
 
   lock_mutex_enter();
@@ -5634,11 +5662,14 @@ dberr_t lock_rec_insert_check_and_lock(
 
   lock = lock_rec_get_first(lock_sys->rec_hash, block, heap_no);
 
+  // 如果 next rec 上面没有 lock, 说明 rec 可以直接插入
+  // 不对插入的 rec 加任何 lock
   if (lock == NULL) {
     /* We optimize CPU time usage in the simplest case */
 
     lock_mutex_exit();
 
+    // inherit_in == TRUE 应该是 乐观插入才会调用
     if (inherit_in && !index->is_clustered()) {
       /* Update the page max trx id field */
       page_update_max_trx_id(block, buf_block_get_page_zip(block), trx->id,
@@ -5656,11 +5687,14 @@ dberr_t lock_rec_insert_check_and_lock(
     return (DB_SUCCESS);
   }
 
+  // 当前插入的记录需要继承 next rec 上的 gap lock
+  // 但是 next rec 上如果有 gap lock, 当前 rec 就不能插入啊?
   *inherit = true;
 
   /* If another transaction has an explicit lock request which locks
   the gap, waiting or granted, on the successor, the insert has to wait.
 
+  // 两个线程同时等一个 gap lock 会死锁?
   An exception is the case where the lock by the another transaction
   is a gap type lock which it placed to wait for its turn to insert. We
   do not consider that kind of a lock conflicting with our insert. This
@@ -5668,8 +5702,10 @@ dberr_t lock_rec_insert_check_and_lock(
   had to wait for their insert. Both had waiting gap type lock requests
   on the successor, which produced an unnecessary deadlock. */
 
+  // 等待 gap 上的 X, 要做插入
   const ulint type_mode = LOCK_X | LOCK_GAP | LOCK_INSERT_INTENTION;
 
+  // 检查是否需要等待 gap lock
   const lock_t *wait_for =
       lock_rec_other_has_conflicting(type_mode, block, heap_no, trx);
 
@@ -5680,6 +5716,7 @@ dberr_t lock_rec_insert_check_and_lock(
 
     trx->owns_mutex = true;
 
+    // 等锁
     err = rec_lock.add_to_waitq(wait_for);
 
     trx->owns_mutex = false;
@@ -6004,6 +6041,9 @@ dberr_t lock_sec_rec_read_check_and_lock(ulint flags, const buf_block_t *block,
   if the max trx id for the page >= min trx id for the trx list or a
   database recovery is running. */
 
+  // 二级索引 rec 上没有 trx_id 字段, 但是所在 page 上有 trx_id
+  // 如果 page trx_id 小于当前最小的活跃事务id, 说明对该页面做修改的事务都已经提交了
+  // 否则需要回表, 检查主索引上 rec trx_id 是否已经提交
   if ((page_get_max_trx_id(block->frame) >= trx_rw_min_trx_id() ||
        recv_recovery_is_on()) &&
       !page_rec_is_supremum(rec)) {
@@ -6012,6 +6052,8 @@ dberr_t lock_sec_rec_read_check_and_lock(ulint flags, const buf_block_t *block,
 
   lock_mutex_enter();
 
+  // trx 对记录加正常记录锁之前, 要对 table 加意向锁
+  // 意向锁用于 ddl 等, 检查table上是否有事务在操作
   ut_ad(mode != LOCK_X ||
         lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
   ut_ad(mode != LOCK_S ||
@@ -6072,9 +6114,12 @@ dberr_t lock_clust_rec_read_check_and_lock(
     return (DB_SUCCESS);
   }
 
+  // rec 在 page 中排在第几个
   heap_no = page_rec_get_heap_no(rec);
 
   if (heap_no != PAGE_HEAP_NO_SUPREMUM) {
+    // 检查rec 上是否有隐式锁
+    // 即, 别的事务刚插入的, 但是那个事务还没提交
     lock_rec_convert_impl_to_expl(block, rec, index, offsets);
   }
 

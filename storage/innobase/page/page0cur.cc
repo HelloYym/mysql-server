@@ -472,6 +472,7 @@ void page_cur_search_with_match(
   /* Perform binary search until the lower and upper limit directory
   slots come to the distance 1 of each other */
 
+  // Infimum 所在 slot 只有 infimum rec 一个, 所以 up - low == 1 时, 就只有一个有 rec 的 slot
   while (up - low > 1) {
     mid = (low + up) / 2;
     slot = page_dir_get_nth_slot(page, mid);
@@ -519,6 +520,7 @@ void page_cur_search_with_match(
     }
   }
 
+  // slot 定义就是一个 byte, 表示页内 offset
   slot = page_dir_get_nth_slot(page, low);
   low_rec = page_dir_slot_get_rec(slot);
   slot = page_dir_get_nth_slot(page, up);
@@ -545,6 +547,8 @@ void page_cur_search_with_match(
                                     &cur_matched_fields);
 
     if (cmp > 0) {
+      // tuple > mid_rec, 把 low_rec 移动到 mid_rec
+      // 因为 low_rec 被置为 mid_rec, 所以 low_matched_fields = cur_matched_fields
     low_rec_match:
       low_rec = mid_rec;
       low_matched_fields = cur_matched_fields;
@@ -557,10 +561,12 @@ void page_cur_search_with_match(
         goto low_rec_match;
       }
 #endif /* PAGE_CUR_LE_OR_EXTENDS */
+      // tuple < mid_rec, 同上, up_rec 移动到 mid_rec
     up_rec_match:
       up_rec = mid_rec;
       up_matched_fields = cur_matched_fields;
     } else if (mode == PAGE_CUR_G || mode == PAGE_CUR_LE
+        // 如果 tuple == mid_rec
 #ifdef PAGE_CUR_LE_OR_EXTENDS
                || mode == PAGE_CUR_LE_OR_EXTENDS
 #endif /* PAGE_CUR_LE_OR_EXTENDS */

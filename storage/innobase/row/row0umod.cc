@@ -429,6 +429,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     mode |= BTR_RTREE_UNDO_INS;
   }
 
+  // 按指定 mode 定位到 sk 的指定 rec 上面
   search_result = row_search_index_entry(index, entry, mode, &pcur, &mtr);
 
   switch (UNIV_EXPECT(search_result, ROW_FOUND)) {
@@ -463,6 +464,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       btr_pcur_restore_position(BTR_SEARCH_LEAF, &(node->pcur), &mtr_vers);
   ut_a(success);
 
+  // 为什么不检查 current rec, 而只检查老版本?
+  // 因为 主索引上 current rec 就是要回滚的
   old_has = row_vers_old_has_index_entry(FALSE, btr_pcur_get_rec(&(node->pcur)),
                                          &mtr_vers, index, entry, 0, 0);
   if (old_has) {
@@ -699,6 +702,7 @@ try_again:
 
       break;
     case ROW_FOUND:
+      // 把二级索引 rec 设置 delete unmark
       err = btr_cur_del_mark_set_sec_rec(BTR_NO_LOCKING_FLAG, btr_cur, FALSE,
                                          thr, &mtr);
 
@@ -708,6 +712,7 @@ try_again:
       offsets_heap = NULL;
       offsets = rec_get_offsets(btr_cur_get_rec(btr_cur), index, NULL,
                                 ULINT_UNDEFINED, &offsets_heap);
+      // 并直接在原地更新
       update = row_upd_build_sec_rec_difference_binary(
           btr_cur_get_rec(btr_cur), index, offsets, entry, heap);
       if (upd_get_n_fields(update) == 0) {
@@ -907,6 +912,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   heap = mem_heap_create(1024);
 
+  // 多个二级索引都需要回滚
   while (node->index != NULL) {
     dict_index_t *index = node->index;
     dtuple_t *entry;
@@ -931,6 +937,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     }
 
     /* Build the newest version of the index entry */
+    // 根据当前这个二级索引构建 entry
     entry = row_build_index_entry(node->row, node->ext, index, heap);
     if (UNIV_UNLIKELY(!entry)) {
       /* The server must have crashed in
@@ -969,6 +976,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       through which we do the search is
       delete-marked. */
 
+      // 逆向操作
+      // 第一步, 删除 update 时候插入的新 rec
       err = row_undo_mod_del_mark_or_remove_sec(node, thr, index, entry);
       if (err != DB_SUCCESS) {
         break;
@@ -986,12 +995,14 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       entry = row_build_index_entry_low(node->undo_row, node->undo_ext, index,
                                         heap, ROW_BUILD_FOR_UNDO);
     } else {
+      // 根据 undo 构建 update 之前原始的 rec
       entry =
           row_build_index_entry(node->undo_row, node->undo_ext, index, heap);
     }
 
     ut_a(entry);
 
+    // 第二步, 把旧的 rec 插回去
     err = row_undo_mod_del_unmark_sec_and_undo_update(
         BTR_MODIFY_LEAF, thr, index, entry, node->undo_no);
     if (err == DB_FAIL) {
@@ -1085,6 +1096,7 @@ static void row_undo_mod_parse_undo_rec(undo_node_t *node, MDL_ticket **mdl) {
   }
 }
 
+// 执行一个 undo 操作
 /** Undoes a modify operation on a row of a table.
  @return DB_SUCCESS or error code */
 dberr_t row_undo_mod(undo_node_t *node, /*!< in: row undo node */
@@ -1121,6 +1133,7 @@ dberr_t row_undo_mod(undo_node_t *node, /*!< in: row undo node */
   /* Skip all corrupted secondary index */
   dict_table_skip_corrupt_index(node->index);
 
+  // 先回滚二级索引
   switch (node->rec_type) {
     case TRX_UNDO_UPD_EXIST_REC:
       err = row_undo_mod_upd_exist_sec(node, thr);
@@ -1135,6 +1148,7 @@ dberr_t row_undo_mod(undo_node_t *node, /*!< in: row undo node */
       ut_error;
   }
 
+  // 回滚二级索引成功后, 再回滚主索引
   if (err == DB_SUCCESS) {
     err = row_undo_mod_clust(node, thr);
   }

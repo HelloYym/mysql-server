@@ -345,12 +345,14 @@ trx_t *row_vers_impl_x_locked_low(
 
   Note: it does not matter which version t we pick, as for our purposes primary
   key fields may be thought as immutable (say, we emulate their modification by
-  combination of delete + insert).
+  combination of delete + insert). pk 更新先 delete 后 insert
 
   Definition 2.
   We say that secondary index row S `matches` a clustered index row C in
   version t if and only if:
     (S[f] = C[t][f] for each column f) and not (C[t].deleted)
+
+  // 一个 sk 可能 match 一个 pk 的多个 version
 
   Note: In the above definition f might be a virtual column.
   Note: There might be multiple versions which a single S `matches`, for
@@ -363,7 +365,7 @@ trx_t *row_vers_impl_x_locked_low(
   version t if and only if:
     (not(S.deleted) and (S `matches` C[t]))
     or
-    (S.deleted and not (S `matches` C[t]))
+    (S.deleted and not (S `matches` C[t])) // C 做了modify, 会删S, 或者C delete 了, S也delete
 
   In other words, S `corresponds-to` C[t] means that the state of secondary
   index row S is synchronized with the state of the row in clustered index in
@@ -498,6 +500,7 @@ trx_t *row_vers_impl_x_locked_low(
 
   trx_t *trx = trx_rw_is_active(trx_id, &corrupt, true);
 
+  // 如果 current ver 上面的 trx_id 已经提交了, 就说明 clust rec 上没有活跃事务
   if (trx == 0) {
     /* The transaction that modified or inserted clust_rec is no
     longer active, or it is corrupt: no implicit lock on rec */
@@ -516,6 +519,7 @@ trx_t *row_vers_impl_x_locked_low(
 
   bool looking_for_match = rec_get_deleted_flag(sec_rec, comp);
 
+  // 在 clust_rec version 中找 match sec_rec 的位置
   if (!row_vers_find_matching(looking_for_match, clust_index, clust_rec,
                               clust_offsets, sec_index, sec_rec, sec_offsets,
                               comp, trx_id, mtr, heap)) {
@@ -1032,6 +1036,7 @@ ibool row_vers_old_has_index_entry(
     v_heap = mem_heap_create(100);
   }
 
+	// 当前主索引上没有 delete mark, 可能有人更新了
   if (also_curr && !rec_get_deleted_flag(rec, comp)) {
     row_ext_t *ext;
 
@@ -1042,6 +1047,8 @@ ibool row_vers_old_has_index_entry(
     'overtake' any read view of an active transaction.
     Thus, it is safe to fetch the prefixes for
     externally stored columns. */
+    // overtake 怎么理解
+    // purge_sys->view 肯定是所有 active 里最老的
     row = row_build(ROW_COPY_POINTERS, clust_index, rec, clust_offsets, NULL,
                     NULL, NULL, &ext, heap);
 
@@ -1105,6 +1112,7 @@ ibool row_vers_old_has_index_entry(
       clust_offsets =
           rec_get_offsets(rec, clust_index, NULL, ULINT_UNDEFINED, &heap);
     } else {
+      // 构建二级索引 entry
       entry = row_build_index_entry(row, ext, index, heap);
 
       /* If entry == NULL, the record contains unset BLOB
@@ -1154,6 +1162,8 @@ ibool row_vers_old_has_index_entry(
     heap = mem_heap_create(1024);
     vrow = NULL;
 
+		// 构建 old version rec
+		// 从最新的 undo 开始
     trx_undo_prev_version_build(
         rec, mtr, version, clust_index, clust_offsets, heap, &prev_version,
         NULL, dict_index_has_virtual(index) ? &vrow : NULL, 0, nullptr);
@@ -1206,6 +1216,8 @@ ibool row_vers_old_has_index_entry(
         dtuple_copy_v_fields(row, cur_vrow);
       }
 
+			// 构建 old version 的 二级索引 entry
+      // 用于比较
       entry = row_build_index_entry(row, ext, index, heap);
 
       /* If entry == NULL, the record contains unset

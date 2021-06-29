@@ -215,6 +215,8 @@ btr_latch_leaves_t btr_cur_latch_leaves(buf_block_t *block,
     case BTR_MODIFY_TREE:
       /* It is exclusive for other operations which calls
       btr_page_set_prev() */
+      // 此时 current block 没有占任何 lock
+      // 所以用 index lock 与 SMO 线程互斥, 防止拿到的 prev no 不对
       ut_ad(mtr_memo_contains_flagged(mtr, dict_index_get_lock(cursor->index),
                                       MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK) ||
             cursor->index->table->is_intrinsic());
@@ -337,6 +339,7 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
   ulint mode;
   page_no_t left_page_no;
 
+  // 只有四种 mode(都是关于leaf) 会尝试乐观restore
   switch (*latch_mode) {
     case BTR_SEARCH_LEAF:
     case BTR_MODIFY_LEAF:
@@ -350,13 +353,16 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
       // 下面这一坨检查 current block 的代码跟 optimistic_get 里差不多
 
       // 问题: block 的 mutex 和 sx lock 什么区别?
+      // mutex 保护 block 结构体中的 变量
+      // sxlock 保护 block->page 中的页数据
       buf_page_mutex_enter(block);
       if (buf_block_get_state(block) != BUF_BLOCK_FILE_PAGE) {
+        // 如果 block 已经不在 bufpool 中, 就不尝试乐观 restore 了
         buf_page_mutex_exit(block);
         return (false);
       }
       /* pin the block not to be relocated */
-      // 这里 pin block 是指什么? block 在内存的位置吗
+      // 走到这里说明 block 还在 bufpool 中, 增加 buffix 不让这个 block 换出
       buf_block_buf_fix_inc(block, file, line);
       buf_page_mutex_exit(block);
 
@@ -365,10 +371,13 @@ bool btr_cur_optimistic_latch_leaves(buf_block_t *block,
       // 如果当前 block 的 modify clock 发生变化，则乐观策略失败
       // 说明在 store position 放开 current block 之后，有人又改过了这个 block
       if (block->modify_clock != modify_clock) {
+        // block 已经不是之前的 block 了
+        // 只能悲观restore
         rw_lock_s_unlock(&block->lock);
 
         goto unpin_failed;
       }
+
       // 拿到前一个 page no
       left_page_no = btr_page_get_prev(buf_block_get_frame(block), mtr);
 
@@ -546,6 +555,8 @@ static bool btr_cur_will_modify_tree(dict_index_t *index, const page_t *page,
     /* NOTE: call mach_read_from_4() directly to avoid assertion
     failure. It is safe because we already have SX latch of the
     index tree */
+    // 1. 删除 rec 后当前 page 可能太小
+    // 2. 当前 level 只有一个 page, 需要做 lift up
     if (page_get_data_size(page) <
             margin + BTR_CUR_PAGE_COMPRESS_LIMIT(index) ||
         (mach_read_from_4(page + FIL_PAGE_NEXT) == FIL_NULL &&
@@ -601,14 +612,19 @@ static bool btr_cur_need_opposite_intention(const page_t *page,
                                             const rec_t *rec) {
   switch (lock_intention) {
     case BTR_INTENTION_DELETE:
+      // 1. rec 是 page first rec, 并且 page 有左兄弟, 说明 child node 也有 左兄弟
+      //    - 子节点可能做 left merge, 此时会删除 page first rec, 导致向上 delete+insert
+      //    - 如果 page 没有左兄弟, 子节点discard 后, delete first rec 会走 min rec 逻辑, 不会 delete/insert
+      // 2. rec 是 page last rec, 并且 page 有右兄弟, 说明 child node 也有 右兄弟
+      //    子节点可能做 right merge, 此时 delete merge block nodeptr, 即删除 right block first rec
       return ((mach_read_from_4(page + FIL_PAGE_PREV) != FIL_NULL &&
                page_rec_is_first(rec, page)) ||
-      // delete 最后一个 rec 有什么影响?
-      // 子节点做了 right merge?
               (mach_read_from_4(page + FIL_PAGE_NEXT) != FIL_NULL &&
                page_rec_is_last(rec, page)));
     case BTR_INTENTION_INSERT:
       // insert 最后一个可能触发 insert to right sibling
+      // 即, 先delete后insert
+      // 注意, 前提是 right sibling 要存在
       return (mach_read_from_4(page + FIL_PAGE_NEXT) != FIL_NULL &&
               page_rec_is_last(rec, page));
     case BTR_INTENTION_BOTH:
@@ -782,7 +798,7 @@ void btr_cur_search_to_nth_level(
   // lock_intention 是随 latch mode 一起传进来的
   lock_intention = btr_cur_get_and_clear_intention(&latch_mode);
 
-  // 这个有什么用?
+  // blob
   modify_external = latch_mode & BTR_MODIFY_EXTERNAL;
 
   /* Turn the flags unrelated to the latch mode off. */
@@ -902,6 +918,8 @@ void btr_cur_search_to_nth_level(
     default:
       if (!srv_read_only_mode) {
         if (s_latch_by_caller) {
+          // 该标志的目的是在找到 leaf node 后, 不直接释放 index lock
+          // 由外部释放
           /* The BTR_ALREADY_S_LATCHED indicates that the index->lock has been
            * taken either in RW_S_LATCH or RW_SX_LATCH mode. */
           ut_ad(rw_lock_own_flagged(dict_index_get_lock(index),
@@ -1246,6 +1264,7 @@ retry_page_get:
       case BTR_MODIFY_TREE:
       case BTR_CONT_MODIFY_TREE:
       case BTR_CONT_SEARCH_TREE:
+        // CONT_XXX_TREE 会走到 level 0 吗? rtree?
         // 沿途没有加 latch 中间节点
         break;
       default:
@@ -1441,6 +1460,7 @@ retry_page_get:
       ut_ad(upper_rw_latch == RW_X_LATCH);
 
       // 之前 n_releases 时始终没有释放 root
+      // 为什么一直不释放 root?
       if (n_releases > 0) {
         /* release root block */
         mtr_release_block_at_savepoint(mtr, tree_savepoints[0], tree_blocks[0]);
@@ -1525,7 +1545,7 @@ retry_page_get:
     the another page might be choosen when BTR_CONT_MODIFY_TREE.
     So, the parent page should not released to avoiding deadlock
     with blocking the another search with the same key value. */
-    // TODO 非唯一索引
+    // 非unique index
     if (!detected_same_key_root && lock_intention == BTR_INTENTION_BOTH &&
         !dict_index_is_unique(index) && latch_mode == BTR_MODIFY_TREE &&
         (up_match >= rec_offs_n_fields(offsets) - 1 ||
@@ -1824,6 +1844,7 @@ retry_page_get:
     will properly check btr_search_enabled again in
     btr_search_build_page_hash_index() before building a
     page hash index, while holding search latch. */
+    // 到达叶节点, 做 ahi 统计
     if (btr_search_enabled && !index->disable_ahi) {
       btr_search_info_update(index, cursor);
     }
@@ -2747,6 +2768,7 @@ UNIV_INLINE MY_ATTRIBUTE((warn_unused_result)) dberr_t
   rec_t *rec;
   roll_ptr_t roll_ptr;
 
+  // 如果需要等待 gap lock, 就生成一个 插入意向锁
   /* Check if we have to wait for a lock: enqueue an explicit lock
   request if yes */
 
@@ -2994,6 +3016,7 @@ dberr_t btr_cur_optimistic_insert(
     } else {
       /* Check locks and write to the undo log,
       if specified */
+      // 插入之前, 获取 rec lock, 并记录 undo
       err = btr_cur_ins_lock_and_undo(flags, cursor, entry, thr, mtr, &inherit);
 
       if (err != DB_SUCCESS) {
@@ -3164,6 +3187,7 @@ dberr_t btr_cur_pessimistic_insert(
     return (err);
   }
 
+  // 需要记 undo 时, 就是主索引 leaf page
   if (!(flags & BTR_NO_UNDO_LOG_FLAG) || index->table->is_intrinsic()) {
     /* First reserve enough free space for the file segments
     of the index tree, so that the insert will not fail because
@@ -3196,6 +3220,7 @@ dberr_t btr_cur_pessimistic_insert(
     big_rec_vec = dtuple_convert_big_rec(index, 0, entry, &n_ext);
 
     if (big_rec_vec == NULL) {
+      // 无法把大字段拆分出来
       if (n_reserved > 0) {
         fil_space_release_free_extents(index->space, n_reserved);
       }
@@ -3213,10 +3238,12 @@ dberr_t btr_cur_pessimistic_insert(
                                      mtr);
   }
 
+  // cursor 指向插入位置(即前一个rec)
   ut_ad(page_rec_get_next(btr_cur_get_rec(cursor)) == *rec ||
         dict_index_is_spatial(index));
 
   if (!(flags & BTR_NO_LOCKING_FLAG)) {
+    // 主索引和二级索引的 leaf page
     ut_ad(!index->table->is_temporary());
     if (dict_index_is_spatial(index)) {
       /* Do nothing */
@@ -3224,11 +3251,17 @@ dberr_t btr_cur_pessimistic_insert(
       /* The cursor might be moved to the other page
       and the max trx id field should be updated after
       the cursor was fixed. */
+      // max trx id 是用来判断二级索引rec隐式锁的
+      // 只需要更新 new rec 所在的 page
+      // 分裂后, rec 不在的另一个 page 的 max trx id, 可能对应的 rec 已经被移走了, 但是 max_trx_id 大于真实值是没问题的
       if (!index->is_clustered()) {
         page_update_max_trx_id(btr_cur_get_block(cursor),
                                btr_cur_get_page_zip(cursor),
                                thr_get_trx(thr)->id, mtr);
       }
+      // 如果插入的rec 是 leaf level page 的第一个 rec, 不需要继承 gap lock
+      // 因为后面再插入 rec, 不会定位到 page 的第一个 slot, 应该在 prev page 的最后一个
+      // nth_level 的 mode 是 LE
       if (!page_rec_is_infimum(btr_cur_get_rec(cursor)) ||
           btr_page_get_prev(buf_block_get_frame(btr_cur_get_block(cursor)),
                             mtr) == FIL_NULL) {
@@ -3658,6 +3691,7 @@ func_exit:
   return (err);
 }
 
+// 乐观更新 rec, 先删除再插入, current block 能够容纳更新的 rec
 /** Tries to update a record on a page in an index tree. It is assumed that mtr
  holds an x-latch on the page. The operation does not succeed if there is too
  little space on the page or if the update would result in too empty a page,
@@ -4022,6 +4056,7 @@ dberr_t btr_cur_pessimistic_update(
   page_zip = buf_block_get_page_zip(block);
   index = cursor->index;
 
+  // 一定是 BTR_MODIFY_TREE
   ut_ad(mtr_memo_contains_flagged(mtr, dict_index_get_lock(index),
                                   MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK) ||
         index->table->is_intrinsic());
@@ -4041,6 +4076,7 @@ dberr_t btr_cur_pessimistic_update(
              BTR_KEEP_SYS_FLAG) ||
         thr_get_trx(thr)->id == trx_id);
 
+  // 乐观更新, 先删后插, current block 能容纳 new rec
   err = optim_err = btr_cur_optimistic_update(
       flags | BTR_KEEP_IBUF_BITMAP, cursor, offsets, offsets_heap, update,
       cmpl_info, thr, trx_id, mtr);
@@ -4069,11 +4105,14 @@ dberr_t btr_cur_pessimistic_update(
       DBUG_RETURN(err);
   }
 
+  // 要更新的 rec
   rec = btr_cur_get_rec(cursor);
 
   *offsets =
       rec_get_offsets(rec, index, *offsets, ULINT_UNDEFINED, offsets_heap);
 
+  // 把 old rec 读出来放到 new_entry 里
+  // n_ext 返回当前 old rec 中 external rec 的数量
   dtuple_t *new_entry =
       row_rec_to_index_entry(rec, index, *offsets, &n_ext, entry_heap);
 
@@ -4083,6 +4122,7 @@ dberr_t btr_cur_pessimistic_update(
   stored fields cannot have been purged yet, because then the
   purge would also have removed the clustered index record
   itself.  Thus the following call is safe. */
+  // 在内存中更新 entry 的 columns
   row_upd_index_replace_new_col_vals_index_pos(new_entry, index, update, FALSE,
                                                entry_heap);
 
@@ -4145,6 +4185,7 @@ dberr_t btr_cur_pessimistic_update(
     ut_ad(flags & BTR_KEEP_POS_FLAG);
   }
 
+  // 记录 TRX_UNDO_UPD_EXIST_REC 类型的 undo
   /* Do lock checking and undo logging */
   err = btr_cur_upd_lock_and_undo(flags, cursor, *offsets, update, cmpl_info,
                                   thr, mtr, &roll_ptr);
@@ -4167,6 +4208,7 @@ dberr_t btr_cur_pessimistic_update(
     }
   }
 
+  // 记录 undo rec 后, 把 new_entry(new rec) 的 roll_ptr 和 trx_id 字段更新
   if (!(flags & BTR_KEEP_SYS_FLAG) && !index->table->is_intrinsic()) {
     row_upd_index_entry_sys_field(new_entry, index, DATA_ROLL_PTR, roll_ptr);
     row_upd_index_entry_sys_field(new_entry, index, DATA_TRX_ID, trx_id);
@@ -4195,7 +4237,11 @@ dberr_t btr_cur_pessimistic_update(
 #endif /* UNIV_ZIP_DEBUG */
   page_cursor = btr_cur_get_page_cur(cursor);
 
+  // 先删掉 old rec
   page_cur_delete_rec(page_cursor, index, *offsets, mtr);
+
+  // 此时不会有其它事务能读到 rec 所在 block, 卡在 X latch 上面, 或者卡在上层 X latch 上面
+  // 等 new_rec 插入完成后, 其它事务才能读到, 再去检查 new_rec 上面的 roll pointer 获取版本
 
   page_cur_move_to_prev(page_cursor);
 
@@ -4337,6 +4383,7 @@ dberr_t btr_cur_pessimistic_update(
   record was nonexistent, the supremum might have inherited its locks
   from a wrong record. */
 
+  // 分裂时, sup rec 继承的 lock 是 updated rec 的后一个 rec
   if (!was_first && !dict_table_is_locking_disabled(index->table)) {
     btr_cur_pess_upd_restore_supremum(btr_cur_get_block(cursor), rec, mtr);
   }
@@ -4956,6 +5003,7 @@ ibool btr_cur_pessimistic_delete(
       non-leaf level, we must mark the new leftmost node
       pointer as the predefined minimum record */
 
+      // 每层的 leftmost rec 之间没有比较关系
       /* This will make page_zip_validate() fail until
       page_cur_delete_rec() completes.  This is harmless,
       because everything will take place within a single
@@ -4997,6 +5045,12 @@ ibool btr_cur_pessimistic_delete(
       on a page, we have to change the parent node pointer
       so that it is equal to the new leftmost node pointer
       on the page */
+      // 为什么 non-leaf page 删除 leftmost rec 之后要更新 parent 的 node_ptr?
+      // search 在 non-leaf level 的 page mode 是 LE
+      // 如果不更新 parent 的 node_ptr, 在 parent 中看到旧的 node_ptr <= tuple
+      // 进入到 current page 后, 却没有 rec 符合 <= tuple, 走到 infimum rec
+      // 无法继续向下走
+      // 而 leaf page 则没有这个问题, 因为到 leaf level 后不需要向下走, 定位到 infimum rec 后就说明 search rec 不存在
 
       // 走到这里, 删除中间节点的第一条 rec
       // 因此要向上删除 current block 在 parrent 中的 node ptr

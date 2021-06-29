@@ -515,6 +515,7 @@ void mtr_t::memo_release(const void *object, ulint type) {
   Find find(object, type);
   Iterate<Find> iterator(find);
 
+  // 如果 mtr_memo 中有多个 page, 只能释放最后一个
   if (!m_impl.m_memo.for_each_block_in_reverse(iterator)) {
     memo_slot_release(find.m_slot);
   }
@@ -534,6 +535,7 @@ void mtr_t::release_page(const void *ptr, mtr_memo_type_t type) {
   Find_page find(ptr, type);
   Iterate<Find_page> iterator(find);
 
+  // 如果 mtr_memo 中有多个 page, 只能释放最后一个
   if (!m_impl.m_memo.for_each_block_in_reverse(iterator)) {
     memo_slot_release(find.get_slot());
     return;

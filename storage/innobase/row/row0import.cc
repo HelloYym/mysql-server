@@ -1549,6 +1549,9 @@ dberr_t row_import::set_instant_info(THD *thd) UNIV_NOTHROW {
   return (DB_SUCCESS);
 }
 
+// import tablespace 后需要 删除 delete mark 的记录
+// 第一轮 PageConverter 无法完全清除
+// 现在开始第二轮悲观删除
 /**
 Purge delete marked records.
 @return DB_SUCCESS or error code. */
@@ -1584,6 +1587,7 @@ void IndexPurge::open() UNIV_NOTHROW {
   mtr_start(&m_mtr);
   mtr_set_log_mode(&m_mtr, MTR_LOG_NO_REDO);
 
+  // X latch 最左页节点
   btr_pcur_open_at_index_side(true, m_index, BTR_MODIFY_LEAF, &m_pcur, true, 0,
                               &m_mtr);
 }
@@ -1612,15 +1616,27 @@ dberr_t IndexPurge::next() UNIV_NOTHROW {
     return (DB_INTERRUPTED);
   }
 
+  // 保存在最后一个 user rec 上面
   btr_pcur_store_position(&m_pcur, &m_mtr);
 
+  // 走到一个 page 的最后, 为什么要提交 mtr?
   mtr_commit(&m_mtr);
 
   mtr_start(&m_mtr);
   mtr_set_log_mode(&m_mtr, MTR_LOG_NO_REDO);
 
+  // 这里为什么用 X lock?
+  // 1. 保证这个page没有别人在读, 不会卡住 purge
+  // 2. 当前线程占着S无法再加X
   btr_pcur_restore_position(BTR_MODIFY_LEAF, &m_pcur, &m_mtr);
 
+  // restore 之后定位到哪里
+  // 1. 乐观 restore 肯定在 old block 最右一个 user rec
+  // 2. 悲观 restore 使用的 mode 是 G, 已经定位到下一个 user rec 了
+  //    但是接下来又 move_to_next_user_rec 就会跳过一个 user rec
+
+  // 这里没有占着 index lock, 如何避免与 SMO 死锁
+  // 从左到右加锁不会死锁
   if (!btr_pcur_move_to_next_user_rec(&m_pcur, &m_mtr)) {
     return (DB_END_OF_INDEX);
   }

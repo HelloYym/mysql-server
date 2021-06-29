@@ -155,6 +155,7 @@ static MY_ATTRIBUTE((warn_unused_result)) bool row_purge_remove_clust_if_poss_lo
   log_free_check();
   mtr_start(&mtr);
 
+	// restore 到 主索引 要删除的 rec 上面
   if (!row_purge_reposition_pcur(mode, node, &mtr)) {
     /* The record was already removed. */
     goto func_exit;
@@ -164,11 +165,15 @@ static MY_ATTRIBUTE((warn_unused_result)) bool row_purge_remove_clust_if_poss_lo
 
   offsets = rec_get_offsets(rec, index, offsets_, ULINT_UNDEFINED, &heap);
 
+  // 被 delete mark 的 rec, 当前 roll_ptr 不是 delete undo 那一条
+  // 说明在 delete mark 后又被更新了
   if (node->roll_ptr != row_get_rec_roll_ptr(rec, index, offsets)) {
     /* Someone else has modified the record later: do not remove */
     goto func_exit;
   }
 
+  // rec 的最后一条 undo 肯定是 delete
+  // 因此 rec 肯定有 delete mark
   ut_ad(rec_get_deleted_flag(rec, rec_offs_comp(offsets)));
 
   if (mode == BTR_MODIFY_LEAF) {
@@ -598,6 +603,7 @@ static MY_ATTRIBUTE((warn_unused_result)) bool row_purge_del_mark(
 
   heap = mem_heap_create(1024);
 
+  // purge 每个二级索引
   while (node->index != NULL) {
     /* skip corrupted secondary index */
     dict_table_skip_corrupt_index(node->index);
@@ -609,6 +615,7 @@ static MY_ATTRIBUTE((warn_unused_result)) bool row_purge_del_mark(
     }
 
     if (node->index->type != DICT_FTS) {
+			// 构建二级索引的 entry
       dtuple_t *entry = row_build_index_entry_low(node->row, NULL, node->index,
                                                   heap, ROW_BUILD_FOR_PURGE);
       row_purge_remove_sec_if_poss(node, node->index, entry);

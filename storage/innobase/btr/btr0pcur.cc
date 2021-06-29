@@ -47,6 +47,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
 
   auto page_cursor = get_page_cur();
 
+  // rec 是指针类型
   auto rec = page_cur_get_rec(page_cursor);
   auto page = page_align(rec);
   auto offs = page_offset(rec);
@@ -92,6 +93,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
 
   // m_rel_pos 指向真正的 rec 位置
   if (page_rec_is_supremum_low(offs)) {
+    // 只是 rec 指向 prev rec, page cur 还在 sup 上面
     rec = page_rec_get_prev(rec);
 
     m_rel_pos = BTR_PCUR_AFTER;
@@ -106,6 +108,7 @@ void btr_pcur_t::store_position(mtr_t *mtr) {
 
   m_old_stored = true;
 
+  // 当前 rec 保存到 pcur 的 m_old_rec_buf 中
   m_old_rec = dict_index_copy_rec_order_prefix(index, rec, &m_old_n_fields,
                                                &m_old_rec_buf, &m_buf_size);
 
@@ -200,6 +203,7 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
 
         auto heap = mem_heap_create(256);
 
+        // 乐观恢复拿到的 rec 必须等于 store 时候的 rec
         offsets1 =
             rec_get_offsets(m_old_rec, index, nullptr, m_old_n_fields, &heap);
 
@@ -212,7 +216,10 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
       }
 
       // 走到这里说明 m_rel_pos 之前不在 user rec 上面
+      // 但是现在 乐观 restore 后在 user rec 上
       // 因此要前后移动一下
+      // 为什么会出现这种情况? page_cur 什么时候移动的?
+      // 这里 page_cur 是 pcur 的, store 时候移动了一次吗?
       /* This is the same record as stored,
       may need to be adjusted for BTR_PCUR_BEFORE/AFTER,
       depending on search mode and direction. */
@@ -235,8 +242,11 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
   tuple = dict_index_build_data_tuple(index, m_old_rec, m_old_n_fields, heap);
 
   /* Save the old search mode of the cursor */
+  // pcur 原本定位时使用的 search mode
   auto old_mode = m_search_mode;
 
+  // 这里的 mode 跟 上层逻辑(比如row_search_mvcc) 没有关系
+  // 目的只是要找到之前 store 的 rec
   switch (m_rel_pos) {
     case BTR_PCUR_ON:
       mode = PAGE_CUR_LE;
@@ -265,6 +275,8 @@ bool btr_pcur_t::restore_position(ulint latch_mode, mtr_t *mtr,
   ut_ad(m_rel_pos == BTR_PCUR_ON || m_rel_pos == BTR_PCUR_BEFORE ||
         m_rel_pos == BTR_PCUR_AFTER);
 
+  // restore 后的rec 与之前 store 时候的rec 完全一致时, 返回 true
+  // 并且不需要 store 一次 rec, 因为和 old 一样的
   if (m_rel_pos == BTR_PCUR_ON && is_on_user_rec() &&
       !cmp_dtuple_rec(
           tuple, get_rec(), index,
@@ -313,6 +325,8 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
 
   auto mode = m_latch_mode;
 
+  // mode 都转化为 leaf level, 单节点latch
+  // BTR_SEARCH_LEAF 和 BTR_MODIFY_LEAF 直接对应于 S 和 X latch
   switch (mode) {
     case BTR_SEARCH_TREE:
     case BTR_PARALLEL_READ_INIT:
@@ -330,6 +344,7 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
 
   auto block = get_block();
 
+  // 直接以对应的 mode 拿 next block
   auto next_block =
       btr_block_get(page_id_t(block->page.id.space(), next_page_no),
                     block->page.size, mode, get_btr_cur()->index, mtr);
@@ -341,8 +356,11 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
   ut_a(btr_page_get_prev(next_page, mtr) == get_block()->page.id.page_no());
 #endif /* UNIV_BTR_DEBUG */
 
+  // 此时已经拿到 next block, 可以释放 current block
+  // 即使以 BTR_MODIFY_TREE 拿着 current 也会释放掉 current
   btr_leaf_page_release(get_block(), mode, mtr);
 
+  // 返回的 page cur 放在 page 的第一条 rec 上
   page_cur_set_before_first(next_block, get_page_cur());
 
   ut_d(page_check_dir(next_page));
@@ -359,6 +377,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   auto old_latch_mode = m_latch_mode;
 
   if (m_latch_mode == BTR_SEARCH_LEAF) {
+    // 先以 BTR_SEARCH_LEAF 到达指定 leaf page, 再根据方向遍历
     latch_mode2 = BTR_SEARCH_PREV;
 
   } else if (m_latch_mode == BTR_MODIFY_LEAF) {
@@ -377,9 +396,8 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
 
   mtr_start(mtr);
 
-  // restore position 之后 page cur 是否指向之前的 rec???
-  // 如果是乐观restore, 肯定是指向之前的位置, 因为没人动过当前 pcur 的 page cur
-  // 如果是悲观restore, 肯定定位到了正确的位置
+  // 1. 乐观 restore 回来, pcur 在 current block 的 inf rec 上
+  // 2. 悲观 restore 回来, pcur 在小于 old rec 的 rec 上
   restore_position(latch_mode2, mtr, __FILE__, __LINE__);
 
   auto page = get_page();
@@ -394,6 +412,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
       ;
     } else if (is_before_first_on_page()) {
       // 这种情况肯定是 乐观restore 回来的, 悲观restore 不会定在 inf上
+      // 如果是乐观restore, 肯定是指向之前的位置, 因为没人动过当前 pcur 的 page cur
       prev_block = get_btr_cur()->left_block;
 
       btr_leaf_page_release(get_block(), old_latch_mode, mtr);
@@ -405,7 +424,7 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
       also on the previous page, but we do not need the latch:
       release it. */
 
-      // 这里肯定是悲观restore 回来的, cur在left page上, 并锁住了更前一个page
+      // 这里肯定是悲观restore 回来的, search_prev 的 mode 是 L, 定位在left page上, 并锁住了更前一个page
       // 要释放掉
       prev_block = get_btr_cur()->left_block;
 
@@ -413,7 +432,10 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
     }
   }
 
+  // 此时只锁了一个 leaf page, 跟 BTR_SEARCH_LEAF 是一样的
+  // BTR_xxx_PREV 只是中间临时用一下
   m_latch_mode = old_latch_mode;
+  // 必须有 m_old_stored 才能下一次 restore
   m_old_stored = false;
 }
 
@@ -430,6 +452,8 @@ bool btr_pcur_t::move_to_prev(mtr_t *mtr) {
       return (false);
     }
 
+    // 这个函数做完, 已经是向前移动一个 rec 了
+    // 不需要再调用 move_to_prev_on_page
     move_backward_from_page(mtr);
 
     return (true);

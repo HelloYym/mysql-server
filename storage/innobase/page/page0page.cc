@@ -677,6 +677,7 @@ rec_t *page_copy_rec_list_start(
   mem_heap_t *heap = NULL;
   ulint num_moved = 0;
   rtr_rec_move_t *rec_move = NULL;
+  // ret 放在 new_block 最后一个 rec 上
   rec_t *ret = page_rec_get_prev(page_get_supremum_rec(new_page));
   ulint offsets_[REC_OFFS_NORMAL_SIZE];
   ulint *offsets = offsets_;
@@ -685,6 +686,7 @@ rec_t *page_copy_rec_list_start(
   /* Here, "ret" may be pointing to a user record or the
   predefined infimum record. */
 
+  // block 中指定的目标 rec 是 inf, 所以不做 copy
   if (page_rec_is_infimum(rec)) {
     return (ret);
   }
@@ -695,9 +697,11 @@ rec_t *page_copy_rec_list_start(
     log_mode = mtr_set_log_mode(mtr, MTR_LOG_NONE);
   }
 
+  // cur1 放在 block 第一个 rec 上, 准备开始遍历
   page_cur_set_before_first(block, &cur1);
   page_cur_move_to_next(&cur1);
 
+  // cur2 放在 new_block 最后一个 rec 上
   cur2 = ret;
 
   /* Copy records from the original page to the new page */
@@ -714,13 +718,18 @@ rec_t *page_copy_rec_list_start(
                                           rec_move, max_to_move, &num_moved,
                                           mtr);
   } else {
+    // 拷贝 block 上从头到目标rec 之间的所有 rec 到 new_block
     while (page_cur_get_rec(&cur1) != rec) {
       rec_t *cur1_rec = page_cur_get_rec(&cur1);
       offsets =
           rec_get_offsets(cur1_rec, index, offsets, ULINT_UNDEFINED, &heap);
+      // 将 cur1_rec 复制到 cur2 后面
+      // 返回的 cur2 是插入的 rec
       cur2 = page_cur_insert_rec_low(cur2, index, cur1_rec, offsets, mtr);
+      // 此处插入必须成功
       ut_a(cur2);
 
+      // 准备 copy 下一个 rec
       page_cur_move_to_next(&cur1);
     }
   }
@@ -746,6 +755,7 @@ rec_t *page_copy_rec_list_start(
 
     if (!page_zip_compress(new_page_zip, new_page, index, page_zip_level,
                            mtr)) {
+      // 压缩失败, 尝试 reorganize
       ulint ret_pos;
 #ifdef UNIV_DEBUG
     zip_reorganize:
@@ -760,6 +770,9 @@ rec_t *page_copy_rec_list_start(
       ret_pos == 0. */
 
       if (UNIV_UNLIKELY(!page_zip_reorganize(new_block, index, mtr))) {
+        // reorganize 也失败了
+        // 说明无法把 rec copy 过去
+        // 把 new_page 恢复到之前的状态, 做法是从 new_page_zip 解压出来
         if (UNIV_UNLIKELY(
                 !page_zip_decompress(new_page_zip, new_page, FALSE))) {
           ut_error;
@@ -783,6 +796,8 @@ rec_t *page_copy_rec_list_start(
   if (dict_index_is_spatial(index)) {
     lock_rtr_move_rec_list(new_block, block, rec_move, num_moved);
   } else if (!dict_table_is_locking_disabled(index->table)) {
+    // rec: block 中的目标rec
+    // ret: new_block 被插入前的最后一个 rec
     lock_move_rec_list_start(new_block, block, rec, ret);
   }
 

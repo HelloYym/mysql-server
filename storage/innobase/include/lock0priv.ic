@@ -202,6 +202,8 @@ lock_t *lock_rec_get_first(
 {
   ut_ad(lock_mutex_own());
 
+  // 每个 block 上面挂了一堆 lock
+  // 需要一个一个判断是属于哪个 rec 的
   for (lock_t *lock = lock_rec_get_first_on_page(hash, block); lock;
        lock = lock_rec_get_next_on_page(lock)) {
     if (lock_rec_get_nth_bit(lock, heap_no)) {

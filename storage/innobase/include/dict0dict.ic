@@ -730,6 +730,7 @@ ulint dict_index_get_n_unique_in_tree(
     return (dict_index_get_n_unique(index));
   }
 
+  // 二级索引的 key 需要带着 pk 才能唯一, 即二级索引的全部字段
   return (static_cast<uint16_t>(dict_index_get_n_fields(index)));
 }
 

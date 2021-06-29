@@ -74,6 +74,7 @@ void btr_search_info_update(
 
   info->hash_analysis++;
 
+  // 每 17 次更新一次 ahi
   if (info->hash_analysis < BTR_SEARCH_HASH_ANALYSIS) {
     /* Do nothing */
 

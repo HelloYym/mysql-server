@@ -3425,14 +3425,22 @@ static ibool sel_restore_position_for_mysql(
 
   success = btr_pcur_restore_position(latch_mode, pcur, mtr);
 
+  // 是否与 store 时指向完全相同的 user rec
+  // 乐观或者悲观
   *same_user_rec = success;
 
   ut_ad(!success || pcur->m_rel_pos == BTR_PCUR_ON);
 #ifdef UNIV_DEBUG
   if (pcur->m_pos_state == BTR_PCUR_IS_POSITIONED_OPTIMISTIC) {
+		// 这里肯定是乐观
+    // store 时在 头尾rec 上, pcur 的 page_cur 被放到了前后一个 user rec 上
+    // 因此 restore 之后要移动一下
     ut_ad(pcur->m_rel_pos == BTR_PCUR_BEFORE ||
           pcur->m_rel_pos == BTR_PCUR_AFTER);
   } else {
+    // 1. 乐观restore, 之前在user rec上, 现在肯定也在
+    // 2. 问题: 悲观restore, 如果之前不在 user rec 上, 现在走了一次 nth_level 肯定在 user rec 上, assert 失败? 即 btr_pcur_is_on_user_rec(pcur) 恒等于 true?
+    //    解释: 悲观restore 后, 又重新 store 了, 因此肯定是没问题的
     ut_ad(pcur->m_pos_state == BTR_PCUR_IS_POSITIONED);
     ut_ad((pcur->m_rel_pos == BTR_PCUR_ON) == btr_pcur_is_on_user_rec(pcur));
   }
@@ -3446,10 +3454,17 @@ static ibool sel_restore_position_for_mysql(
       return (TRUE);
     case BTR_PCUR_ON:
       if (!success && moves_up) {
+        // 乐观恢复不会走到这里, 因为 BTR_PCUR_ON 时, success 一定为 true
+        // 这里的情况只可能是, restore 时采用 LE 模式 search, 但是之前的 user_rec 已经找不到了
+        // 此时定位到 L 上, 如果正好是 moves_up, 那就往右移动一个, 正好就是 G than old rec
       next:
         btr_pcur_move_to_next(pcur, mtr);
         return (TRUE);
       }
+      // 1. 如果!success && !move_up, 那此时定位到 L 上是刚好的
+      //    已经定位到下一个 prev rec 了, return true 表示外面可以直接处理这个 rec
+      //
+      // 2. 对于 success, 就定位到 old rec, return false 表示这个记录是 old rec, 外面已经处理过的
       return (!success);
     case BTR_PCUR_AFTER_LAST_IN_TREE:
     case BTR_PCUR_BEFORE_FIRST_IN_TREE:
@@ -3457,6 +3472,8 @@ static ibool sel_restore_position_for_mysql(
     case BTR_PCUR_AFTER:
       /* positioned to record after pcur->old_rec. */
       pcur->m_pos_state = BTR_PCUR_IS_POSITIONED;
+      // 悲观: nth_level 遍历用的是 G, 反向遍历肯定要往前移动一个
+      // 乐观: 为什么还要向前移动?
     prev:
       if (btr_pcur_is_on_user_rec(pcur) && !moves_up) {
         btr_pcur_move_to_prev(pcur, mtr);
@@ -3473,6 +3490,8 @@ static ibool sel_restore_position_for_mysql(
       switch (pcur->m_pos_state) {
         case BTR_PCUR_IS_POSITIONED_OPTIMISTIC:
           pcur->m_pos_state = BTR_PCUR_IS_POSITIONED;
+          // pcur->m_search_mode 什么时候设置的? 表示什么?
+          // 同上, 乐观为什么要移动?
           if (pcur->m_search_mode == PAGE_CUR_GE) {
             /* Positioned during Greater or Equal search
             with BTR_PCUR_BEFORE. Optimistic restore to
@@ -4469,6 +4488,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     goto func_exit;
   }
 
+  // search 操作都是在这个 mtr 中的, 后面所有 mtr 都是在这一个里
   mtr_start(&mtr);
 
   /*-------------------------------------------------------------*/
@@ -4588,12 +4608,14 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   /*-------------------------------------------------------------*/
   /* PHASE 3: Open or restore index cursor position */
 
+  // R-tree 的 search, 不考虑这个
   spatial_search = dict_index_is_spatial(index) && mode >= PAGE_CUR_CONTAIN;
 
   /* The state of a running trx can only be changed by the
   thread that is currently serving the transaction. Because we
   are that thread, we can read trx->state without holding any
   mutex. */
+  // trx 对应于 current thread, 只有 current thd 可以修改 trx, 因此我们可以无锁读取 trx 的变量
   ut_ad(prebuilt->sql_stat_start || trx->state == TRX_STATE_ACTIVE);
 
   ut_ad(!trx_is_started(trx) || trx->state == TRX_STATE_ACTIVE);
@@ -4620,11 +4642,15 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   otherwise downward */
 
   if (direction == 0) {
+    // 为什么 point query 也要 move up
+    // 因为 range query 是两步: 先 point query, 再goto next
+    // 所以第一次 point query 时, 就知道了之后 move 的方向
     if (mode == PAGE_CUR_GE || mode == PAGE_CUR_G || mode >= PAGE_CUR_CONTAIN) {
       moves_up = TRUE;
     }
 
   } else if (direction == ROW_SEL_NEXT) {
+    // direction 非0 表示 range query
     moves_up = TRUE;
   }
 
@@ -4634,6 +4660,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
 
   clust_index = index->table->first_index();
 
+  // sec index 中不完全包含查找字段, 需要回表操作
   clust_templ_for_sec =
       index != clust_index && prebuilt->need_to_access_clustered;
 
@@ -4662,10 +4689,12 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     prebuilt->sql_stat_start = FALSE;
   } else {
   wait_table_again:
+    // 先对 table 加意向锁
     err = lock_table(0, index->table,
                      prebuilt->select_lock_type == LOCK_S ? LOCK_IS : LOCK_IX,
                      thr);
 
+    // table 加锁不成功, mtr commit, 线程等待
     if (err != DB_SUCCESS) {
       table_lock_waited = TRUE;
       goto lock_table_wait;
@@ -4676,11 +4705,15 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
   /* Open or restore index cursor position */
 
   if (UNIV_LIKELY(direction != 0)) {
+    // direction != 0, 表示 range query, direction = ROW_SEL_NEXT | ROW_SEL_PREV
+
     if (spatial_search) {
       /* R-Tree access does not need to do
       cursor position and resposition */
       goto next_rec;
     }
+
+    // direction != 0 说明之前肯定 store 过
 
     ibool need_to_process = sel_restore_position_for_mysql(
         &same_user_rec, BTR_SEARCH_LEAF, pcur, moves_up, &mtr);
@@ -4701,6 +4734,7 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
       pessimistic locking read, the record
       cannot be skipped. */
 
+      // restore 定位到了之前的 rec 上面, 需要 goto next
       goto next_rec;
     }
 
@@ -4725,6 +4759,10 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
       }
     }
 
+    // 第一次根据 mode 来放置 pcur
+    // pcur->m_search_mode 被设置了
+    // 例如 select xxx >= a
+    // mode 就是 GE
     btr_pcur_open_with_no_init(index, search_tuple, mode, BTR_SEARCH_LEAF, pcur,
                                0, &mtr);
 
@@ -4792,6 +4830,7 @@ rec_loop:
     goto next_rec;
   }
 
+  // 如果走到 sup rec 怎么办
   if (page_rec_is_supremum(rec)) {
     DBUG_EXECUTE_IF("compare_end_range",
                     if (end_loop < 100) { end_loop = 100; });
@@ -4875,6 +4914,7 @@ rec_loop:
   /* Do sanity checks in case our cursor has bumped into page
   corruption */
 
+  // 检查定位的 rec 是否合法
   if (comp) {
     next_offs = rec_get_next_offs(rec, TRUE);
     if (UNIV_UNLIKELY(next_offs < PAGE_NEW_SUPREMUM)) {
@@ -4927,8 +4967,10 @@ rec_loop:
   /* Calculate the 'offsets' associated with 'rec' */
 
   ut_ad(fil_page_index_page_check(btr_pcur_get_page(pcur)));
+  // pcur 定位到的 page 所属的 index 必须正确
   ut_ad(btr_page_get_index_id(btr_pcur_get_page(pcur)) == index->id);
 
+  // 当前 rec 对应的 offset
   offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED, &heap);
 
   if (UNIV_UNLIKELY(srv_force_recovery > 0)) {
@@ -4945,6 +4987,7 @@ rec_loop:
     }
   }
 
+  // 把当前定位的 rec 赋值给 prev_rec
   prev_rec = rec;
 
   /* Note that we cannot trust the up_match value in the cursor at this
@@ -4952,12 +4995,15 @@ rec_loop:
   we have to recompare rec and search_tuple to determine if they
   match enough. */
 
+  // 只有 range query 的 match_mode == 0
   if (match_mode == ROW_SEL_EXACT) {
+    // 这里是非like 形式的 point query
     /* Test if the index record matches completely to search_tuple
     in prebuilt: if not, then we return with DB_RECORD_NOT_FOUND */
 
     /* fputs("Comparing rec and search tuple\n", stderr); */
 
+    // 检查当前search 到的rec 是否与 search tuple 相等, 如果不相等说明没找到
     if (0 != cmp_dtuple_rec(search_tuple, rec, index, offsets)) {
       if (set_also_gap_locks && !trx->skip_gap_locks() &&
           prebuilt->select_lock_type != LOCK_NONE &&
@@ -4977,6 +5023,7 @@ rec_loop:
         }
       }
 
+      // 点查询失败也要 store 吗, 作用是什么?
       btr_pcur_store_position(pcur, &mtr);
 
       /* The found record was not a match, but may be used
@@ -4985,13 +5032,16 @@ rec_loop:
       the persistent cursor is before the found/stored row
       (pcur->m_old_rec). */
       ut_ad(pcur->m_rel_pos == BTR_PCUR_ON);
+      // 当前 rec 不是要找的 tuple, 为什么要设置为 before, 而不是 after
       pcur->m_rel_pos = BTR_PCUR_BEFORE;
 
+      // 返回 not found
       err = DB_RECORD_NOT_FOUND;
       goto normal_return;
     }
 
   } else if (match_mode == ROW_SEL_EXACT_PREFIX) {
+    // like 形式的 select 语句
     if (!cmp_dtuple_is_prefix_of_rec(search_tuple, rec, index, offsets)) {
       if (set_also_gap_locks && !trx->skip_gap_locks() &&
           prebuilt->select_lock_type != LOCK_NONE &&
@@ -5150,6 +5200,9 @@ rec_loop:
     /* This is a non-locking consistent read: if necessary, fetch
     a previous version of the record */
 
+    // 常见的 mvcc read
+    // 不需要对 rec 加锁
+
     if (trx->isolation_level == TRX_ISO_READ_UNCOMMITTED) {
       /* Do nothing: we let a non-locking SELECT read the
       latest version of the record */
@@ -5159,6 +5212,8 @@ rec_loop:
       one is not visible in the snapshot; if we have a very
       high force recovery level set, we try to avoid crashes
       by skipping this lookup */
+
+      // 如果是主索引, 需要拿当前 read view 比较一下可见性
 
       if (srv_force_recovery < 5 &&
           !lock_clust_rec_cons_read_sees(rec, index, offsets,
@@ -5255,6 +5310,7 @@ locks_ok:
   }
 
   /* Check if the record matches the index condition. */
+  // 检查rec 是否满足查询条件
   switch (row_search_idx_cond_check(buf, prebuilt, rec, offsets)) {
     case ICP_NO_MATCH:
       if (did_semi_consistent_read) {
@@ -5271,6 +5327,7 @@ locks_ok:
   /* Get the clustered index record if needed, if we did not do the
   search using the clustered index. */
 
+  // select 的字段有不在 覆盖索引中的, 因此要回表操作
   if (index != clust_index && prebuilt->need_to_access_clustered) {
   requires_clust_rec:
     ut_ad(index != clust_index);
@@ -5290,6 +5347,7 @@ locks_ok:
     /* The following call returns 'offsets' associated with
     'clust_rec'. Note that 'clust_rec' can be an old version
     built for a consistent read. */
+    // 根据 sec index 中的 rec 找到 clust index 中的 rec
     err = row_sel_get_clust_rec_for_mysql(
         prebuilt, index, rec, thr, &clust_rec, &offsets, &heap,
         need_vrow ? &vrow : NULL, &mtr, prebuilt->get_lob_undo());
@@ -5409,6 +5467,8 @@ locks_ok:
   See ha_innobase::ha_is_record_buffer_wanted(). */
   ut_ad(prebuilt->can_prefetch_records() || record_buffer == nullptr);
 
+  // 此时 pcur 已经定位到一个 page 上了, 并且占着 S latch
+  // 可以 prefetch 这个 page 上更多的 rec, 放到 record buf 中
   /* Decide whether to prefetch extra rows.
   At this point, the clustered index record is protected
   by a page latch that was acquired when pcur was positioned.
@@ -5573,6 +5633,7 @@ locks_ok:
   err = DB_SUCCESS;
 
 idx_cond_failed:
+  // 主索引的点查询不需要 store pcur
   if (!unique_search || !index->is_clustered() || direction != 0 ||
       prebuilt->select_lock_type != LOCK_NONE || prebuilt->used_in_HANDLER ||
       prebuilt->innodb_api) {
@@ -5637,8 +5698,12 @@ next_rec:
   the cursor is positioned will remain buffer-fixed.
   For R-tree spatial search, we also commit the mini-transaction
   each time  */
+  // 正向遍历: 同一个 mtr 一直用, 加到下一个 page, 释放当前 page
+  // 反向遍历: btr_search_prev, 需要先提交当前 mtr, 再 mtr start, 因为不能占右加左
 
   if (mtr_has_extra_clust_latch || spatial_search) {
+    // 如果在顺序遍历 sec index, 并需要回表操作, 此时肯定占着 clust index 的 page
+    // 必须先释放当前 mtr, 因为 sec index 的顺序遍历, 对应的 clust index 中并不顺序, 可能死锁
     /* If we have extra cluster latch, we must commit
     mtr if we are moving to the next non-clustered
     index record, because we could break the latching
@@ -5650,12 +5715,15 @@ next_rec:
       btr_pcur_store_position(pcur, &mtr);
     }
 
+    // mtr_commit 后就释放了所有 page
     mtr_commit(&mtr);
     mtr_has_extra_clust_latch = FALSE;
 
     mtr_start(&mtr);
 
     if (!spatial_search &&
+        // pcur restore 到 sec index 下一个 rec
+        // 此处没有处理返回值 success, 如何判断是否要移动
         sel_restore_position_for_mysql(&same_user_rec, BTR_SEARCH_LEAF, pcur,
                                        moves_up, &mtr)) {
       goto rec_loop;
@@ -5673,14 +5741,17 @@ next_rec:
     }
 
     if (!move) {
+      // pcur 已经在 leaf level 的 最右, move == false
     not_moved:
       if (!spatial_search) {
         btr_pcur_store_position(pcur, &mtr);
       }
 
       if (match_mode != 0) {
+        // point query 没找到记录
         err = DB_RECORD_NOT_FOUND;
       } else {
+        // range query 说明走到尽头
         err = DB_END_OF_INDEX;
       }
 
